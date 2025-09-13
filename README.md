@@ -115,6 +115,69 @@ timeout-mcp --auto-restart 30 python unreliable-mcp-server.py
 timeout-mcp --auto-restart 45 uvx weather-mcp --api-key YOUR_KEY
 ```
 
+### MCP Client Configuration Examples
+
+#### VS Code (mcp.json)
+```jsonc
+{
+  "servers": {
+    "weather-server": {
+      "command": "timeout-mcp",
+      "args": ["30", "python", "weather-server.py", "--api-key", "YOUR_KEY"],
+      "env": {
+        "API_KEY": "your-weather-api-key"
+      }
+    },
+    "filesystem-server": {
+      "command": "timeout-mcp", 
+      "args": ["--auto-restart", "45", "uvx", "mcp-server-filesystem", "--root", "/safe/directory"]
+    }
+  }
+}
+```
+
+#### Claude Desktop Configuration
+```jsonc
+{
+  "mcpServers": {
+    "weather": {
+      "command": "timeout-mcp",
+      "args": ["30", "python", "/path/to/weather-server.py"],
+      "env": {
+        "WEATHER_API_KEY": "your-key-here"
+      }
+    },
+    "database": {
+      "command": "timeout-mcp",
+      "args": ["--auto-restart", "60", "node", "/path/to/db-server.js", "--connection", "postgres://..."]
+    }
+  }
+}
+```
+
+#### Generic MCP Client Configuration
+```jsonc
+{
+  "servers": {
+    "my-server": {
+      "command": "timeout-mcp",
+      "args": [
+        "--auto-restart",  // Enable auto-restart on timeout
+        "45",              // 45 second timeout
+        "python",          // Your MCP server command
+        "my-mcp-server.py",
+        "--custom-arg",
+        "value"
+      ],
+      "cwd": "/path/to/server/directory",
+      "env": {
+        "SERVER_CONFIG": "production"
+      }
+    }
+  }
+}
+```
+
 ## JSON-RPC Behavior
 
 ### Methods with Timeout
