@@ -121,7 +121,7 @@ timeout-mcp --auto-restart 45 uvx weather-mcp --api-key YOUR_KEY
 The following methods have timeout applied:
 
 #### Tool Calls
-```json
+```jsonc
 // Request
 {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "get_weather", "arguments": {"city": "San Francisco"}}}
 
@@ -133,7 +133,7 @@ The following methods have timeout applied:
 ```
 
 #### Initialize
-```json
+```jsonc
 // Request
 {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"clientInfo": {"name": "test-client"}}}
 
@@ -142,7 +142,7 @@ The following methods have timeout applied:
 ```
 
 #### Tools List
-```json
+```jsonc
 // Request
 {"jsonrpc": "2.0", "id": 2, "method": "tools/list"}
 
@@ -151,7 +151,7 @@ The following methods have timeout applied:
 ```
 
 ### Methods without Timeout (immediate forwarding)
-```json
+```jsonc
 // Notifications - forwarded immediately
 {"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": 1}}
 
