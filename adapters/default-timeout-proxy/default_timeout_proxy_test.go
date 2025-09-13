@@ -1138,6 +1138,10 @@ func TestDefaultTimeoutProxy_AutoRestart_StopError(t *testing.T) {
 	mockCommandPort.EXPECT().Stop().Return(fmt.Errorf("stop failed"))
 	mockCommandPort.EXPECT().Start().Return(nil)
 
+	// Mock expectations for new reader goroutine after restart
+	mockStdout := &mockReadCloser{strings.NewReader("")}
+	mockCommandPort.EXPECT().GetStdout().Return(mockStdout).AnyTimes()
+
 	// Mock expectation for proxy.Close() at the end
 	mockCommandPort.EXPECT().Stop().Return(nil)
 

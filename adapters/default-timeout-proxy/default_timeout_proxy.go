@@ -323,7 +323,12 @@ func (p *DefaultTimeoutProxy) readTargetResponses() {
 	defer func() {
 		p.mu.Lock()
 		if p.readerDone != nil {
-			close(p.readerDone)
+			select {
+			case <-p.readerDone:
+				// Channel already closed
+			default:
+				close(p.readerDone)
+			}
 		}
 		p.mu.Unlock()
 	}()
