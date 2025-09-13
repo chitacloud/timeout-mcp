@@ -173,7 +173,7 @@ When the `--auto-restart` flag is enabled, the wrapper automatically restarts th
 
 ### Example Error Response with Auto-Restart
 
-```json
+```jsonc
 // Timeout Response with auto-restart enabled
 {"jsonrpc": "2.0", "id": 1, "error": {"code": -32603, "message": "Method 'tools/call' timed out after 30s (restarting now...)"}}
 ```
