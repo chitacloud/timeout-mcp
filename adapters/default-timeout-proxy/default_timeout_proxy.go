@@ -206,11 +206,11 @@ func (p *DefaultTimeoutProxy) restartCommand() {
 	if err := p.commandPort.Stop(); err != nil {
 		log.Printf("Warning: Failed to stop command during restart: %v", err)
 	}
-	
+
 	for id := range p.pendingCalls {
 		delete(p.pendingCalls, id)
 	}
-	
+
 	if err := p.commandPort.Start(); err != nil {
 		log.Printf("Error: Failed to restart MCP server: %v", err)
 		return
@@ -223,12 +223,21 @@ func (p *DefaultTimeoutProxy) restartCommand() {
 	// Start new reader goroutine
 	go p.readTargetResponses()
 
+	// Check if we need to auto-initialize before releasing the lock
+	shouldAutoInit := p.initialized
+
+	// Release the mutex before calling sendAutoInitializeAndWait to avoid deadlock
+	p.mu.Unlock()
+
 	// If we were previously initialized, automatically re-initialize the restarted MCP server
-	if p.initialized {
+	if shouldAutoInit {
 		p.sendAutoInitializeAndWait()
 	}
 
 	log.Printf("MCP server restarted successfully")
+
+	// Re-acquire the lock briefly to satisfy the defer
+	p.mu.Lock()
 }
 
 // sendAutoInitializeAndWait resends the exact initialization request and waits for response
@@ -312,15 +321,21 @@ func (p *DefaultTimeoutProxy) sendToClient(msg jsonrpcentities.JSONRPCMessage) e
 // readTargetResponses reads responses from the target MCP server
 func (p *DefaultTimeoutProxy) readTargetResponses() {
 	defer func() {
+		p.mu.Lock()
 		if p.readerDone != nil {
 			close(p.readerDone)
 		}
+		p.mu.Unlock()
 	}()
 
 	for {
-		if p.stopReader != nil {
+		p.mu.RLock()
+		stopReader := p.stopReader
+		p.mu.RUnlock()
+
+		if stopReader != nil {
 			select {
-			case <-p.stopReader:
+			case <-stopReader:
 				return
 			default:
 			}
