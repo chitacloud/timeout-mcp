@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -23,10 +24,14 @@ var (
 // DefaultTimeoutProxy implements TimeoutProxy interface
 type DefaultTimeoutProxy struct {
 	timeout      time.Duration
-	autoRestart  bool
 	commandPort  commandport.CommandPort
-	pendingCalls map[interface{}]chan jsonrpcentities.JSONRPCMessage
+	pendingCalls map[any]chan jsonrpcentities.JSONRPCMessage
 	mu           sync.RWMutex
+	autoRestart  bool
+	stopReader   chan struct{}
+	readerDone   chan struct{}
+	initialized  bool                            // Track if MCP server has been initialized before
+	initMessage  *jsonrpcentities.JSONRPCMessage // Store the original initialize message
 }
 
 // DefaultTimeoutProxyFactory implements TimeoutProxyFactory
@@ -43,7 +48,9 @@ func (f *DefaultTimeoutProxyFactory) NewTimeoutProxy(timeout time.Duration, auto
 		timeout:      timeout,
 		autoRestart:  autoRestart,
 		commandPort:  commandPort,
-		pendingCalls: make(map[interface{}]chan jsonrpcentities.JSONRPCMessage),
+		pendingCalls: make(map[any]chan jsonrpcentities.JSONRPCMessage),
+		stopReader:   make(chan struct{}),
+		readerDone:   make(chan struct{}),
 	}, nil
 }
 
@@ -106,6 +113,14 @@ func (p *DefaultTimeoutProxy) shouldApplyTimeout(method string) bool {
 
 // handleTimeoutMethod processes any method that requires timeout handling
 func (p *DefaultTimeoutProxy) handleTimeoutMethod(msg jsonrpcentities.JSONRPCMessage) error {
+	// Track if we've seen an initialize message and store it for restart
+	if msg.Method == "initialize" {
+		p.initialized = true
+		// Store a copy of the original initialize message for restart
+		msgCopy := msg
+		p.initMessage = &msgCopy
+	}
+
 	// Create a channel to receive the response
 	responseChan := make(chan jsonrpcentities.JSONRPCMessage, 1)
 
@@ -145,7 +160,7 @@ func (p *DefaultTimeoutProxy) handleTimeoutMethod(msg jsonrpcentities.JSONRPCMes
 		} else {
 			errorMessage = fmt.Sprintf("Method '%s' timed out after %s", msg.Method, p.timeout.String())
 		}
-		
+
 		errorResponse := jsonrpcentities.JSONRPCMessage{
 			JSONRPC: "2.0",
 			ID:      msg.ID,
@@ -161,26 +176,98 @@ func (p *DefaultTimeoutProxy) handleTimeoutMethod(msg jsonrpcentities.JSONRPCMes
 // restartCommand restarts the underlying MCP server process
 func (p *DefaultTimeoutProxy) restartCommand() {
 	log.Printf("Auto-restarting MCP server due to timeout...")
-	
-	// Stop the current command
+
+	// Stop the current reader goroutine
+	if p.stopReader != nil {
+		select {
+		case <-p.stopReader:
+			// Already closed
+		default:
+			close(p.stopReader)
+		}
+
+		// Wait for reader to stop
+		if p.readerDone != nil {
+			select {
+			case <-p.readerDone:
+			case <-time.After(500 * time.Millisecond):
+				// Timeout waiting for reader to stop
+			}
+		}
+	}
+
 	if err := p.commandPort.Stop(); err != nil {
 		log.Printf("Warning: Failed to stop command during restart: %v", err)
 	}
-	
-	// Clear all pending calls since they're invalid after restart
 	p.mu.Lock()
 	for id := range p.pendingCalls {
 		delete(p.pendingCalls, id)
 	}
 	p.mu.Unlock()
-	
-	// Start the command again
 	if err := p.commandPort.Start(); err != nil {
 		log.Printf("Error: Failed to restart MCP server: %v", err)
 		return
 	}
-	
+
+	// Create new channels for the new reader goroutine
+	p.stopReader = make(chan struct{})
+	p.readerDone = make(chan struct{})
+
+	// Start new reader goroutine
+	go p.readTargetResponses()
+
+	// If we were previously initialized, automatically re-initialize the restarted MCP server
+	if p.initialized {
+		p.sendAutoInitializeAndWait()
+	}
+
 	log.Printf("MCP server restarted successfully")
+}
+
+// sendAutoInitializeAndWait resends the exact initialization request and waits for response
+func (p *DefaultTimeoutProxy) sendAutoInitializeAndWait() {
+	if p.initMessage == nil {
+		log.Printf("Warning: No stored initialization message to resend")
+		return
+	}
+
+	log.Printf("Auto-initializing restarted MCP server with original client request...")
+
+	// Create a temporary response channel for the initialization
+	responseChan := make(chan jsonrpcentities.JSONRPCMessage, 1)
+
+	p.mu.Lock()
+	p.pendingCalls[p.initMessage.ID] = responseChan
+	p.mu.Unlock()
+
+	// Send the exact original initialize message (keeping same ID for session continuity)
+	if err := p.forwardMessage(*p.initMessage); err != nil {
+		log.Printf("Warning: Failed to auto-initialize restarted MCP server: %v", err)
+		p.mu.Lock()
+		delete(p.pendingCalls, p.initMessage.ID)
+		p.mu.Unlock()
+		return
+	}
+
+	// Wait for the initialization response with a timeout
+	select {
+	case resp := <-responseChan:
+		p.mu.Lock()
+		delete(p.pendingCalls, p.initMessage.ID)
+		p.mu.Unlock()
+
+		if resp.Error != nil {
+			log.Printf("Warning: Auto-initialization failed with error: %v", resp.Error.Message)
+		} else {
+			log.Printf("Auto-initialization completed successfully")
+		}
+	case <-time.After(5 * time.Second):
+		// Timeout waiting for initialization response
+		p.mu.Lock()
+		delete(p.pendingCalls, p.initMessage.ID)
+		p.mu.Unlock()
+		log.Printf("Warning: Auto-initialization timed out after 5 seconds")
+	}
 }
 
 // forwardMessage sends a message to the target MCP server
@@ -217,51 +304,124 @@ func (p *DefaultTimeoutProxy) sendToClient(msg jsonrpcentities.JSONRPCMessage) e
 
 // readTargetResponses reads responses from the target MCP server
 func (p *DefaultTimeoutProxy) readTargetResponses() {
-
-	scanner := bufio.NewScanner(p.commandPort.GetStdout())
-	for scanner.Scan() {
-		line := scanner.Bytes()
-		if len(line) == 0 {
-			continue
+	defer func() {
+		if p.readerDone != nil {
+			close(p.readerDone)
 		}
+	}()
 
-		var msg jsonrpcentities.JSONRPCMessage
-		if err := json.Unmarshal(line, &msg); err != nil {
-			log.Printf("Failed to parse target response: %v", err)
-			continue
-		}
-
-		// Check if this is a response to a pending tool call
-		if msg.ID != nil {
-			p.mu.RLock()
-			responseChan, exists := p.pendingCalls[msg.ID]
-			p.mu.RUnlock()
-
-			if exists {
-				// This is a response to a tool call - send it through the channel
-				select {
-				case responseChan <- msg:
-					// Response sent successfully - don't delete here, let handleToolCall do it
-				default:
-					// Channel might be closed due to timeout, forward directly
-					p.sendToClient(msg)
-				}
-				continue
+	for {
+		if p.stopReader != nil {
+			select {
+			case <-p.stopReader:
+				return
+			default:
 			}
 		}
 
-		// For all other messages (notifications, other responses), forward directly
-		if err := p.sendToClient(msg); err != nil {
-			log.Printf("Failed to forward response: %v", err)
+		stdout := p.commandPort.GetStdout()
+		if stdout == nil {
+			// Stdout not ready yet, wait a bit
+			time.Sleep(10 * time.Millisecond)
+			continue
 		}
-	}
 
-	if err := scanner.Err(); err != nil && err != io.EOF {
-		log.Printf("Error reading from target stdout: %v", err)
+		scanner := bufio.NewScanner(stdout)
+		// Increase buffer size to handle large JSON responses (e.g., from file operations)
+		maxTokenSize := 16 * 1024 * 1024 // 16MB max token size
+		buf := make([]byte, maxTokenSize)
+		scanner.Buffer(buf, maxTokenSize)
+
+		for scanner.Scan() {
+			if p.stopReader != nil {
+				select {
+				case <-p.stopReader:
+					return
+				default:
+				}
+			}
+
+			line := scanner.Bytes()
+			if len(line) == 0 {
+				continue
+			}
+
+			var msg jsonrpcentities.JSONRPCMessage
+			if err := json.Unmarshal(line, &msg); err != nil {
+				log.Printf("Failed to parse target response: %v", err)
+				continue
+			}
+
+			// Check if this is a response to a pending tool call
+			if msg.ID != nil {
+				p.mu.RLock()
+				responseChan, exists := p.pendingCalls[msg.ID]
+				p.mu.RUnlock()
+
+				if exists {
+					// This is a response to a tool call - send it through the channel
+					select {
+					case responseChan <- msg:
+						// Response sent successfully - don't delete here, let handleToolCall do it
+					default:
+						// Channel might be closed due to timeout, forward directly
+						p.sendToClient(msg)
+					}
+					continue
+				}
+			}
+
+			// For all other messages (notifications, other responses), forward directly
+			if err := p.sendToClient(msg); err != nil {
+				log.Printf("Failed to forward response: %v", err)
+			}
+		}
+
+		if err := scanner.Err(); err != nil && err != io.EOF {
+			// Don't spam logs for expected closed pipe errors during restart
+			if !strings.Contains(err.Error(), "closed pipe") && !strings.Contains(err.Error(), "file already closed") {
+				log.Printf("Error reading from target stdout: %v", err)
+			}
+			// If it's a closed pipe error, likely a restart occurred - stop this reader
+			return
+		}
+
+		// If we reach here, the scanner stopped (likely due to closed stdout after restart)
+		// Wait a bit before trying again, but check for stop signal first
+		if p.stopReader != nil {
+			select {
+			case <-p.stopReader:
+				return
+			case <-time.After(100 * time.Millisecond):
+				// Continue to next iteration
+			}
+		} else {
+			time.Sleep(100 * time.Millisecond)
+		}
 	}
 }
 
 // Close cleans up the proxy resources
 func (p *DefaultTimeoutProxy) Close() error {
+	// Signal the reader goroutine to stop (check if channel exists and isn't closed)
+	if p.stopReader != nil {
+		select {
+		case <-p.stopReader:
+			// Already closed
+		default:
+			close(p.stopReader)
+		}
+	}
+
+	// Wait for the reader to finish (with timeout to avoid hanging)
+	if p.readerDone != nil {
+		select {
+		case <-p.readerDone:
+			// Reader finished cleanly
+		case <-time.After(1 * time.Second):
+			// Timeout waiting for reader, continue with cleanup
+		}
+	}
+
 	return p.commandPort.Stop()
 }

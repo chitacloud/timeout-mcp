@@ -28,7 +28,7 @@ func TestJSONRPCMessage_Marshal(t *testing.T) {
 				JSONRPC: "2.0",
 				ID:      1,
 				Method:  "tools/call",
-				Params:  map[string]interface{}{"name": "test_tool"},
+				Params:  map[string]any{"name": "test_tool"},
 			},
 			expected: `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"test_tool"}}`,
 		},
@@ -37,7 +37,7 @@ func TestJSONRPCMessage_Marshal(t *testing.T) {
 			msg: jsonrpcentities.JSONRPCMessage{
 				JSONRPC: "2.0",
 				ID:      1,
-				Result:  map[string]interface{}{"success": true},
+				Result:  map[string]any{"success": true},
 			},
 			expected: `{"jsonrpc":"2.0","id":1,"result":{"success":true}}`,
 		},
@@ -62,12 +62,12 @@ func TestJSONRPCMessage_Marshal(t *testing.T) {
 				t.Fatalf("Failed to marshal message: %v", err)
 			}
 
-			var expected map[string]interface{}
+			var expected map[string]any
 			if err := json.Unmarshal([]byte(tt.expected), &expected); err != nil {
 				t.Fatalf("Failed to unmarshal expected: %v", err)
 			}
 
-			var actual map[string]interface{}
+			var actual map[string]any
 			if err := json.Unmarshal(data, &actual); err != nil {
 				t.Fatalf("Failed to unmarshal actual: %v", err)
 			}
@@ -92,7 +92,7 @@ func TestJSONRPCMessage_Unmarshal(t *testing.T) {
 				JSONRPC: "2.0",
 				ID:      float64(1), // JSON unmarshaling converts numbers to float64
 				Method:  "tools/call",
-				Params:  map[string]interface{}{"name": "test_tool"},
+				Params:  map[string]any{"name": "test_tool"},
 			},
 		},
 		{
@@ -101,7 +101,7 @@ func TestJSONRPCMessage_Unmarshal(t *testing.T) {
 			expected: jsonrpcentities.JSONRPCMessage{
 				JSONRPC: "2.0",
 				Method:  "notification",
-				Params:  map[string]interface{}{},
+				Params:  map[string]any{},
 			},
 		},
 	}
@@ -135,7 +135,7 @@ func TestTimeoutProxy_Creation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create command port: %v", err)
 	}
-	
+
 	factory := &defaulttimeoutproxy.DefaultTimeoutProxyFactory{}
 	proxy, err := factory.NewTimeoutProxy(5*time.Second, false, commandPort)
 	if err != nil {
@@ -215,7 +215,7 @@ func TestTimeoutProxy_ActualTimeout(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create command port: %v", err)
 	}
-	
+
 	factory := &defaulttimeoutproxy.DefaultTimeoutProxyFactory{}
 	proxy, err := factory.NewTimeoutProxy(500*time.Millisecond, false, commandPort)
 	if err != nil {
@@ -223,13 +223,12 @@ func TestTimeoutProxy_ActualTimeout(t *testing.T) {
 	}
 	defer proxy.Close()
 
-
 	// Create a tool call message
 	toolCall := jsonrpcentities.JSONRPCMessage{
 		JSONRPC: "2.0",
 		ID:      1,
 		Method:  "tools/call",
-		Params:  map[string]interface{}{"name": "slow_tool"},
+		Params:  map[string]any{"name": "slow_tool"},
 	}
 
 	// Capture stdout to check the timeout error
@@ -285,9 +284,9 @@ func TestTimeoutProxy_ActualTimeout(t *testing.T) {
 
 // Test 5: TDD - Test non-tool calls are forwarded immediately
 func TestTimeoutProxy_ForwardNonToolCalls(t *testing.T) {
-	// This test verifies that non-tool calls (anything other than "tools/call") 
+	// This test verifies that non-tool calls (anything other than "tools/call")
 	// are forwarded immediately without timeout logic
-	
+
 	// Create a simple echo command that returns JSON
 	script := `echo '{"jsonrpc":"2.0","id":1,"result":{"status":"initialized"}}'`
 	commandFactory := &defaultcommandadapter.DefaultCommandAdapterFactory{}
@@ -295,7 +294,7 @@ func TestTimeoutProxy_ForwardNonToolCalls(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create command port: %v", err)
 	}
-	
+
 	factory := &defaulttimeoutproxy.DefaultTimeoutProxyFactory{}
 	proxy, err := factory.NewTimeoutProxy(1*time.Second, false, commandPort)
 	if err != nil {
@@ -308,7 +307,7 @@ func TestTimeoutProxy_ForwardNonToolCalls(t *testing.T) {
 		JSONRPC: "2.0",
 		ID:      1,
 		Method:  "initialize",
-		Params:  map[string]interface{}{"capabilities": map[string]interface{}{}},
+		Params:  map[string]any{"capabilities": map[string]any{}},
 	}
 
 	// Capture output
@@ -364,7 +363,7 @@ func TestTimeoutProxy_ForwardNonToolCalls(t *testing.T) {
 	lines := strings.Split(output, "\n")
 	var response jsonrpcentities.JSONRPCMessage
 	var validJSON bool
-	
+
 	for _, line := range lines {
 		if strings.TrimSpace(line) == "" {
 			continue
@@ -374,7 +373,7 @@ func TestTimeoutProxy_ForwardNonToolCalls(t *testing.T) {
 			break
 		}
 	}
-	
+
 	if !validJSON {
 		t.Errorf("Got output but failed to parse any line as JSON-RPC, output: %s", output)
 		return
@@ -395,7 +394,7 @@ func TestTimeoutProxy_BasicForwarding(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create command port: %v", err)
 	}
-	
+
 	factory := &defaulttimeoutproxy.DefaultTimeoutProxyFactory{}
 	proxy, err := factory.NewTimeoutProxy(1*time.Second, false, commandPort)
 	if err != nil {
@@ -424,24 +423,24 @@ func TestTimeoutProxy_ResponseChannel(t *testing.T) {
 // Tests for parseArgs function
 func TestParseArgs_Success(t *testing.T) {
 	args := []string{"program", "30", "echo", "hello", "world"}
-	
+
 	timeout, autoRestart, command, targetArgs, err := parseArgs(args)
 	if err != nil {
 		t.Errorf("Expected no error, got: %v", err)
 	}
-	
+
 	if timeout != 30*time.Second {
 		t.Errorf("Expected timeout 30s, got %v", timeout)
 	}
-	
+
 	if autoRestart != false {
 		t.Errorf("Expected autoRestart false, got %v", autoRestart)
 	}
-	
+
 	if command != "echo" {
 		t.Errorf("Expected command 'echo', got %s", command)
 	}
-	
+
 	expectedArgs := []string{"hello", "world"}
 	if len(targetArgs) != len(expectedArgs) {
 		t.Errorf("Expected %d args, got %d", len(expectedArgs), len(targetArgs))
@@ -455,24 +454,24 @@ func TestParseArgs_Success(t *testing.T) {
 
 func TestParseArgs_NoTargetArgs(t *testing.T) {
 	args := []string{"program", "15", "ls"}
-	
+
 	timeout, autoRestart, command, targetArgs, err := parseArgs(args)
 	if err != nil {
 		t.Errorf("Expected no error, got: %v", err)
 	}
-	
+
 	if timeout != 15*time.Second {
 		t.Errorf("Expected timeout 15s, got %v", timeout)
 	}
-	
+
 	if autoRestart != false {
 		t.Errorf("Expected autoRestart false, got %v", autoRestart)
 	}
-	
+
 	if command != "ls" {
 		t.Errorf("Expected command 'ls', got %s", command)
 	}
-	
+
 	if len(targetArgs) != 0 {
 		t.Errorf("Expected no target args, got %v", targetArgs)
 	}
@@ -516,7 +515,7 @@ func TestParseArgs_InvalidTimeout(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			args := []string{"program", tt.timeout, "echo", "hello"}
-			
+
 			_, _, _, _, err := parseArgs(args)
 			if err == nil {
 				t.Error("Expected error for invalid timeout")

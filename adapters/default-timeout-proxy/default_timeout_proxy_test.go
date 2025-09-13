@@ -7,12 +7,14 @@ import (
 	"io"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
-	"github.com/chitacloud/timeout-mcp/mocks"
-	"github.com/chitacloud/timeout-mcp/ports/jsonrpc/entities"
 	"go.uber.org/mock/gomock"
+
+	"github.com/chitacloud/timeout-mcp/mocks"
+	jsonrpcentities "github.com/chitacloud/timeout-mcp/ports/jsonrpc/entities"
 )
 
 func TestDefaultTimeoutProxyFactory_NewTimeoutProxy_Success(t *testing.T) {
@@ -67,7 +69,7 @@ func TestDefaultTimeoutProxy_GetTimeout(t *testing.T) {
 	timeout := 10 * time.Second
 	proxy := &DefaultTimeoutProxy{
 		timeout:      timeout,
-		pendingCalls: make(map[interface{}]chan jsonrpcentities.JSONRPCMessage),
+		pendingCalls: make(map[any]chan jsonrpcentities.JSONRPCMessage),
 	}
 
 	if proxy.GetTimeout() != timeout {
@@ -86,7 +88,7 @@ func TestDefaultTimeoutProxy_HandleMessage_NonToolCall(t *testing.T) {
 	proxy := &DefaultTimeoutProxy{
 		timeout:      5 * time.Second,
 		commandPort:  mockCommandPort,
-		pendingCalls: make(map[interface{}]chan jsonrpcentities.JSONRPCMessage),
+		pendingCalls: make(map[any]chan jsonrpcentities.JSONRPCMessage),
 	}
 
 	msg := jsonrpcentities.JSONRPCMessage{
@@ -119,7 +121,7 @@ func TestDefaultTimeoutProxy_HandleMessage_ToolCall_Success(t *testing.T) {
 	proxy := &DefaultTimeoutProxy{
 		timeout:      5 * time.Second,
 		commandPort:  mockCommandPort,
-		pendingCalls: make(map[interface{}]chan jsonrpcentities.JSONRPCMessage),
+		pendingCalls: make(map[any]chan jsonrpcentities.JSONRPCMessage),
 	}
 
 	msg := jsonrpcentities.JSONRPCMessage{
@@ -185,7 +187,7 @@ func TestDefaultTimeoutProxy_HandleMessage_ToolCall_Timeout(t *testing.T) {
 	proxy := &DefaultTimeoutProxy{
 		timeout:      timeout,
 		commandPort:  mockCommandPort,
-		pendingCalls: make(map[interface{}]chan jsonrpcentities.JSONRPCMessage),
+		pendingCalls: make(map[any]chan jsonrpcentities.JSONRPCMessage),
 	}
 
 	msg := jsonrpcentities.JSONRPCMessage{
@@ -327,36 +329,46 @@ func TestDefaultTimeoutProxy_readTargetResponses_NonToolCall(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
-	// Create a mock reader with JSON-RPC response
-	responseData := `{"jsonrpc":"2.0","id":"non-tool","result":{"success":true}}`
+	// Test data with non-tool call ID
+	responseData := "{\"jsonrpc\":\"2.0\",\"id\":\"non-tool\",\"result\":{\"success\":true}}\n"
 	mockStdout := &mockReadCloser{strings.NewReader(responseData)}
-	
 	mockCommandPort := mocks.NewMockCommandPort(ctrl)
 	mockCommandPort.EXPECT().GetStdout().Return(mockStdout).AnyTimes()
 
+	// Create proxy with pending call
+	responseChan := make(chan jsonrpcentities.JSONRPCMessage, 1)
 	proxy := &DefaultTimeoutProxy{
 		commandPort:  mockCommandPort,
-		pendingCalls: make(map[interface{}]chan jsonrpcentities.JSONRPCMessage),
+		pendingCalls: map[any]chan jsonrpcentities.JSONRPCMessage{"non-tool": responseChan},
+		mu:           sync.RWMutex{},
+		stopReader:   make(chan struct{}),
+		readerDone:   make(chan struct{}),
 	}
 
-	// Start readTargetResponses in goroutine since it blocks
-	done := make(chan bool, 1)
-	go func() {
-		proxy.readTargetResponses()
-		done <- true
-	}()
+	// Start reader
+	go proxy.readTargetResponses()
 
-	// Give time for method to read and process
-	time.Sleep(50 * time.Millisecond)
-
-	// Close the reader to exit the loop
-	mockStdout.Close()
-
-	// Wait for completion
+	// Wait for response
 	select {
-	case <-done:
-		// Success
-	case <-time.After(1 * time.Second):
+	case response := <-responseChan:
+		if response.ID != "non-tool" {
+			t.Errorf("Expected ID 'non-tool', got %v", response.ID)
+		}
+		if response.Result == nil {
+			t.Error("Expected result to be present")
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("Response not received in time")
+	}
+
+	// Stop reader and wait for completion
+	close(proxy.stopReader)
+
+	// Wait for reader to complete with timeout
+	select {
+	case <-proxy.readerDone:
+		// Success - reader completed
+	case <-time.After(200 * time.Millisecond):
 		t.Fatal("readTargetResponses did not complete in time")
 	}
 }
@@ -368,29 +380,25 @@ func TestDefaultTimeoutProxy_readTargetResponses_PendingToolCall(t *testing.T) {
 	// Create a mock reader with tool call response
 	responseData := `{"jsonrpc":"2.0","id":"tool-call-123","result":{"data":"test"}}`
 	mockStdout := &mockReadCloser{strings.NewReader(responseData)}
-	
+
 	mockCommandPort := mocks.NewMockCommandPort(ctrl)
 	mockCommandPort.EXPECT().GetStdout().Return(mockStdout).AnyTimes()
 
 	// Create response channel for pending tool call
 	responseChan := make(chan jsonrpcentities.JSONRPCMessage, 1)
-	pendingCalls := make(map[interface{}]chan jsonrpcentities.JSONRPCMessage)
+	pendingCalls := make(map[any]chan jsonrpcentities.JSONRPCMessage)
 	pendingCalls["tool-call-123"] = responseChan
 
 	proxy := &DefaultTimeoutProxy{
 		commandPort:  mockCommandPort,
 		pendingCalls: pendingCalls,
+		mu:           sync.RWMutex{},
+		stopReader:   make(chan struct{}),
+		readerDone:   make(chan struct{}),
 	}
 
-	// Start readTargetResponses in goroutine since it blocks
-	done := make(chan bool, 1)
-	go func() {
-		proxy.readTargetResponses()
-		done <- true
-	}()
-
-	// Give time for method to read and process
-	time.Sleep(50 * time.Millisecond)
+	// Start readTargetResponses in goroutine
+	go proxy.readTargetResponses()
 
 	// Check if response was sent to channel
 	select {
@@ -402,14 +410,14 @@ func TestDefaultTimeoutProxy_readTargetResponses_PendingToolCall(t *testing.T) {
 		t.Fatal("Expected response to be sent to channel")
 	}
 
-	// Close the reader to exit the loop
-	mockStdout.Close()
+	// Properly stop the reader
+	close(proxy.stopReader)
 
 	// Wait for completion
 	select {
-	case <-done:
+	case <-proxy.readerDone:
 		// Success
-	case <-time.After(1 * time.Second):
+	case <-time.After(200 * time.Millisecond):
 		t.Fatal("readTargetResponses did not complete in time")
 	}
 }
@@ -421,33 +429,32 @@ func TestDefaultTimeoutProxy_readTargetResponses_InvalidJSON(t *testing.T) {
 	// Create a mock reader with invalid JSON
 	responseData := `{"jsonrpc":"2.0","id":"test" INVALID JSON}`
 	mockStdout := &mockReadCloser{strings.NewReader(responseData)}
-	
+
 	mockCommandPort := mocks.NewMockCommandPort(ctrl)
 	mockCommandPort.EXPECT().GetStdout().Return(mockStdout).AnyTimes()
 
 	proxy := &DefaultTimeoutProxy{
 		commandPort:  mockCommandPort,
-		pendingCalls: make(map[interface{}]chan jsonrpcentities.JSONRPCMessage),
+		pendingCalls: make(map[any]chan jsonrpcentities.JSONRPCMessage),
+		mu:           sync.RWMutex{},
+		stopReader:   make(chan struct{}),
+		readerDone:   make(chan struct{}),
 	}
 
-	// Start readTargetResponses in goroutine since it blocks
-	done := make(chan bool, 1)
-	go func() {
-		proxy.readTargetResponses()
-		done <- true
-	}()
+	// Start readTargetResponses in goroutine
+	go proxy.readTargetResponses()
 
 	// Give time for method to read and process
 	time.Sleep(50 * time.Millisecond)
 
-	// Close the reader to exit the loop
-	mockStdout.Close()
+	// Properly stop the reader
+	close(proxy.stopReader)
 
 	// Wait for completion (should handle invalid JSON gracefully)
 	select {
-	case <-done:
+	case <-proxy.readerDone:
 		// Success - invalid JSON should be logged but not fail
-	case <-time.After(1 * time.Second):
+	case <-time.After(200 * time.Millisecond):
 		t.Fatal("readTargetResponses did not complete in time")
 	}
 }
@@ -463,7 +470,7 @@ func TestDefaultTimeoutProxy_handleToolCall_ErrorForwarding(t *testing.T) {
 	proxy := &DefaultTimeoutProxy{
 		timeout:      5 * time.Second,
 		commandPort:  mockCommandPort,
-		pendingCalls: make(map[interface{}]chan jsonrpcentities.JSONRPCMessage),
+		pendingCalls: make(map[any]chan jsonrpcentities.JSONRPCMessage),
 	}
 
 	msg := jsonrpcentities.JSONRPCMessage{
@@ -499,7 +506,7 @@ func TestDefaultTimeoutProxy_handleToolCall_ChannelTimeout(t *testing.T) {
 	proxy := &DefaultTimeoutProxy{
 		timeout:      timeout,
 		commandPort:  mockCommandPort,
-		pendingCalls: make(map[interface{}]chan jsonrpcentities.JSONRPCMessage),
+		pendingCalls: make(map[any]chan jsonrpcentities.JSONRPCMessage),
 	}
 
 	msg := jsonrpcentities.JSONRPCMessage{
@@ -530,36 +537,35 @@ func TestDefaultTimeoutProxy_readTargetResponses_ChannelBlocked(t *testing.T) {
 	// Create a mock reader with tool call response
 	responseData := `{"jsonrpc":"2.0","id":"blocked-channel","result":{"data":"test"}}`
 	mockStdout := &mockReadCloser{strings.NewReader(responseData)}
-	
+
 	mockCommandPort := mocks.NewMockCommandPort(ctrl)
 	mockCommandPort.EXPECT().GetStdout().Return(mockStdout).AnyTimes()
 
 	// Create a non-buffered channel that will block
 	responseChan := make(chan jsonrpcentities.JSONRPCMessage)
-	pendingCalls := make(map[interface{}]chan jsonrpcentities.JSONRPCMessage)
+	pendingCalls := make(map[any]chan jsonrpcentities.JSONRPCMessage)
 	pendingCalls["blocked-channel"] = responseChan
 
 	proxy := &DefaultTimeoutProxy{
 		commandPort:  mockCommandPort,
 		pendingCalls: pendingCalls,
+		mu:           sync.RWMutex{},
+		stopReader:   make(chan struct{}),
+		readerDone:   make(chan struct{}),
 	}
 
 	// Start readTargetResponses in goroutine since it blocks
-	done := make(chan bool, 1)
-	go func() {
-		proxy.readTargetResponses()
-		done <- true
-	}()
+	go proxy.readTargetResponses()
 
 	// Give time for method to read and process
 	time.Sleep(50 * time.Millisecond)
 
-	// Close the reader to exit the loop
-	mockStdout.Close()
+	// Signal to stop the reader and wait for completion
+	close(proxy.stopReader)
 
 	// Wait for completion - should handle blocked channel via default case
 	select {
-	case <-done:
+	case <-proxy.readerDone:
 		// Success - blocked channel should use default case to send directly to client
 	case <-time.After(1 * time.Second):
 		t.Fatal("readTargetResponses did not complete in time")
@@ -622,7 +628,7 @@ func TestDefaultTimeoutProxy_Run_ScannerError(t *testing.T) {
 	proxy := &DefaultTimeoutProxy{
 		timeout:      5 * time.Second,
 		commandPort:  mockCommand,
-		pendingCalls: make(map[interface{}]chan jsonrpcentities.JSONRPCMessage),
+		pendingCalls: make(map[any]chan jsonrpcentities.JSONRPCMessage),
 	}
 
 	// Create pipes for stdin/stdout
@@ -655,7 +661,7 @@ func TestDefaultTimeoutProxy_Run_ProcessNotRunning(t *testing.T) {
 	proxy := &DefaultTimeoutProxy{
 		timeout:      5 * time.Second,
 		commandPort:  mockCommand,
-		pendingCalls: make(map[interface{}]chan jsonrpcentities.JSONRPCMessage),
+		pendingCalls: make(map[any]chan jsonrpcentities.JSONRPCMessage),
 	}
 
 	// Create pipes
@@ -664,7 +670,7 @@ func TestDefaultTimeoutProxy_Run_ProcessNotRunning(t *testing.T) {
 
 	mockCommand.EXPECT().GetStdin().Return(stdinWriter).AnyTimes()
 	mockCommand.EXPECT().GetStdout().Return(stdoutReader).AnyTimes()
-	
+
 	// Mock IsRunning to return false (process not running) - allow multiple calls
 	mockCommand.EXPECT().IsRunning().Return(false).AnyTimes()
 
@@ -693,7 +699,7 @@ func TestDefaultTimeoutProxy_readTargetResponses_ChannelBlock(t *testing.T) {
 	proxy := &DefaultTimeoutProxy{
 		timeout:      100 * time.Millisecond,
 		commandPort:  mockCommand,
-		pendingCalls: make(map[interface{}]chan jsonrpcentities.JSONRPCMessage),
+		pendingCalls: make(map[any]chan jsonrpcentities.JSONRPCMessage),
 	}
 
 	// Create a test response channel that's blocked
@@ -730,7 +736,7 @@ func TestDefaultTimeoutProxy_readTargetResponses_ChannelBlock(t *testing.T) {
 
 func TestDefaultTimeoutProxy_shouldApplyTimeout(t *testing.T) {
 	proxy := &DefaultTimeoutProxy{}
-	
+
 	testCases := []struct {
 		method   string
 		expected bool
@@ -743,7 +749,7 @@ func TestDefaultTimeoutProxy_shouldApplyTimeout(t *testing.T) {
 		{"resources/list", false},
 		{"", false},
 	}
-	
+
 	for _, tc := range testCases {
 		t.Run(tc.method, func(t *testing.T) {
 			result := proxy.shouldApplyTimeout(tc.method)
@@ -762,7 +768,7 @@ func TestDefaultTimeoutProxy_HandleMessage_Initialize(t *testing.T) {
 	proxy := &DefaultTimeoutProxy{
 		timeout:      50 * time.Millisecond,
 		commandPort:  mockCommandPort,
-		pendingCalls: make(map[interface{}]chan jsonrpcentities.JSONRPCMessage),
+		pendingCalls: make(map[any]chan jsonrpcentities.JSONRPCMessage),
 	}
 
 	mockStdin := &mockWriteCloser{&bytes.Buffer{}}
@@ -772,7 +778,7 @@ func TestDefaultTimeoutProxy_HandleMessage_Initialize(t *testing.T) {
 		JSONRPC: "2.0",
 		Method:  "initialize",
 		ID:      "init-id",
-		Params:  map[string]interface{}{"capabilities": map[string]interface{}{}},
+		Params:  map[string]any{"capabilities": map[string]any{}},
 	}
 
 	err := proxy.HandleMessage(msg)
@@ -789,7 +795,7 @@ func TestDefaultTimeoutProxy_HandleMessage_ToolsList(t *testing.T) {
 	proxy := &DefaultTimeoutProxy{
 		timeout:      50 * time.Millisecond,
 		commandPort:  mockCommandPort,
-		pendingCalls: make(map[interface{}]chan jsonrpcentities.JSONRPCMessage),
+		pendingCalls: make(map[any]chan jsonrpcentities.JSONRPCMessage),
 	}
 
 	mockStdin := &mockWriteCloser{&bytes.Buffer{}}
@@ -814,13 +820,13 @@ func TestDefaultTimeoutProxy_Run_Success(t *testing.T) {
 	mockCommandPort := mocks.NewMockCommandPort(ctrl)
 	mockStdout := &mockReadCloser{strings.NewReader("")}
 	mockStdin := &mockWriteCloser{&bytes.Buffer{}}
-	
+
 	mockCommandPort.EXPECT().GetStdout().Return(mockStdout).AnyTimes()
 	mockCommandPort.EXPECT().GetStdin().Return(mockStdin).AnyTimes()
 
 	proxy := &DefaultTimeoutProxy{
 		commandPort:  mockCommandPort,
-		pendingCalls: make(map[interface{}]chan jsonrpcentities.JSONRPCMessage),
+		pendingCalls: make(map[any]chan jsonrpcentities.JSONRPCMessage),
 	}
 
 	// Create pipes to simulate stdin
@@ -852,11 +858,11 @@ func TestDefaultTimeoutProxy_Run_Success(t *testing.T) {
 	// Verify message was forwarded
 	expectedData, _ := json.Marshal(jsonrpcentities.JSONRPCMessage{
 		JSONRPC: "2.0",
-		Method:  "initialize", 
+		Method:  "initialize",
 		ID:      "test",
 	})
 	expectedData = append(expectedData, '\n')
-	
+
 	if !bytes.Equal(mockStdin.Buffer.Bytes(), expectedData) {
 		t.Error("Message was not forwarded correctly")
 	}
@@ -868,12 +874,12 @@ func TestDefaultTimeoutProxy_Run_EmptyLines(t *testing.T) {
 
 	mockCommandPort := mocks.NewMockCommandPort(ctrl)
 	mockStdout := &mockReadCloser{strings.NewReader("")}
-	
+
 	mockCommandPort.EXPECT().GetStdout().Return(mockStdout).AnyTimes()
 
 	proxy := &DefaultTimeoutProxy{
 		commandPort:  mockCommandPort,
-		pendingCalls: make(map[interface{}]chan jsonrpcentities.JSONRPCMessage),
+		pendingCalls: make(map[any]chan jsonrpcentities.JSONRPCMessage),
 	}
 
 	// Create pipes to simulate stdin with empty lines
@@ -908,12 +914,12 @@ func TestDefaultTimeoutProxy_Run_InvalidJSON(t *testing.T) {
 
 	mockCommandPort := mocks.NewMockCommandPort(ctrl)
 	mockStdout := &mockReadCloser{strings.NewReader("")}
-	
+
 	mockCommandPort.EXPECT().GetStdout().Return(mockStdout).AnyTimes()
 
 	proxy := &DefaultTimeoutProxy{
 		commandPort:  mockCommandPort,
-		pendingCalls: make(map[interface{}]chan jsonrpcentities.JSONRPCMessage),
+		pendingCalls: make(map[any]chan jsonrpcentities.JSONRPCMessage),
 	}
 
 	// Create pipes to simulate stdin with invalid JSON
@@ -931,7 +937,7 @@ func TestDefaultTimeoutProxy_Run_InvalidJSON(t *testing.T) {
 
 	// Write invalid JSON and close
 	go func() {
-		w.Write([]byte(`{"invalid": "json" SYNTAX ERROR}`+ "\n"))
+		w.Write([]byte(`{"invalid": "json" SYNTAX ERROR}` + "\n"))
 		w.Close()
 	}()
 
@@ -949,13 +955,13 @@ func TestDefaultTimeoutProxy_Run_HandleMessageError(t *testing.T) {
 	mockCommandPort := mocks.NewMockCommandPort(ctrl)
 	mockStdout := &mockReadCloser{strings.NewReader("")}
 	mockStdin := &errorWriteCloser{}
-	
+
 	mockCommandPort.EXPECT().GetStdout().Return(mockStdout).AnyTimes()
 	mockCommandPort.EXPECT().GetStdin().Return(mockStdin).AnyTimes()
 
 	proxy := &DefaultTimeoutProxy{
 		commandPort:  mockCommandPort,
-		pendingCalls: make(map[interface{}]chan jsonrpcentities.JSONRPCMessage),
+		pendingCalls: make(map[any]chan jsonrpcentities.JSONRPCMessage),
 	}
 
 	// Create pipes to simulate stdin
@@ -992,7 +998,7 @@ func TestDefaultTimeoutProxy_sendToClient_WriteFailure(t *testing.T) {
 	msg := jsonrpcentities.JSONRPCMessage{
 		JSONRPC: "2.0",
 		ID:      "test",
-		Result:  map[string]interface{}{"success": true},
+		Result:  map[string]any{"success": true},
 	}
 
 	// Capture original stdout
@@ -1021,31 +1027,30 @@ func TestDefaultTimeoutProxy_readTargetResponses_ScanError(t *testing.T) {
 
 	// Create a mock reader that will cause scanner errors
 	mockStdout := &mockReadCloser{strings.NewReader("invalid\x00json\nwith\x00null\x00bytes")}
-	
+
 	mockCommandPort := mocks.NewMockCommandPort(ctrl)
 	mockCommandPort.EXPECT().GetStdout().Return(mockStdout).AnyTimes()
 
 	proxy := &DefaultTimeoutProxy{
 		commandPort:  mockCommandPort,
-		pendingCalls: make(map[interface{}]chan jsonrpcentities.JSONRPCMessage),
+		pendingCalls: make(map[any]chan jsonrpcentities.JSONRPCMessage),
+		mu:           sync.RWMutex{},
+		stopReader:   make(chan struct{}),
+		readerDone:   make(chan struct{}),
 	}
 
 	// Start readTargetResponses in goroutine
-	done := make(chan bool, 1)
-	go func() {
-		proxy.readTargetResponses()
-		done <- true
-	}()
+	go proxy.readTargetResponses()
 
 	// Give time for processing
 	time.Sleep(50 * time.Millisecond)
 
-	// Close the reader to exit the loop
-	mockStdout.Close()
+	// Signal to stop the reader and wait for completion
+	close(proxy.stopReader)
 
 	// Wait for completion
 	select {
-	case <-done:
+	case <-proxy.readerDone:
 		// Success - should handle scan errors gracefully
 	case <-time.After(1 * time.Second):
 		t.Fatal("readTargetResponses did not complete in time")
@@ -1077,14 +1082,18 @@ func TestDefaultTimeoutProxy_AutoRestart_Success(t *testing.T) {
 	defer ctrl.Finish()
 
 	mockCommandPort := mocks.NewMockCommandPort(ctrl)
-	
+
 	// Initial start
 	mockCommandPort.EXPECT().Start().Return(nil)
-	
+
 	// Mock expectations for restart sequence
 	mockCommandPort.EXPECT().Stop().Return(nil)
 	mockCommandPort.EXPECT().Start().Return(nil)
-	
+
+	// Mock expectations for new reader goroutine after restart
+	mockStdout := &mockReadCloser{strings.NewReader("")}
+	mockCommandPort.EXPECT().GetStdout().Return(mockStdout).AnyTimes()
+
 	// Mock expectation for proxy.Close() at the end
 	mockCommandPort.EXPECT().Stop().Return(nil)
 
@@ -1099,7 +1108,7 @@ func TestDefaultTimeoutProxy_AutoRestart_Success(t *testing.T) {
 
 	// Get concrete type to access restartCommand method
 	concreteProxy := proxy.(*DefaultTimeoutProxy)
-	
+
 	// Add a pending call to test cleanup during restart
 	concreteProxy.mu.Lock()
 	concreteProxy.pendingCalls[1] = make(chan jsonrpcentities.JSONRPCMessage, 1)
@@ -1121,14 +1130,14 @@ func TestDefaultTimeoutProxy_AutoRestart_StopError(t *testing.T) {
 	defer ctrl.Finish()
 
 	mockCommandPort := mocks.NewMockCommandPort(ctrl)
-	
+
 	// Initial start
 	mockCommandPort.EXPECT().Start().Return(nil)
-	
+
 	// Mock expectations for restart sequence with stop error
 	mockCommandPort.EXPECT().Stop().Return(fmt.Errorf("stop failed"))
 	mockCommandPort.EXPECT().Start().Return(nil)
-	
+
 	// Mock expectation for proxy.Close() at the end
 	mockCommandPort.EXPECT().Stop().Return(nil)
 
@@ -1143,7 +1152,7 @@ func TestDefaultTimeoutProxy_AutoRestart_StopError(t *testing.T) {
 
 	// Get concrete type to access restartCommand method
 	concreteProxy := proxy.(*DefaultTimeoutProxy)
-	
+
 	// Test restartCommand method handles stop error gracefully
 	concreteProxy.restartCommand()
 }
@@ -1153,14 +1162,14 @@ func TestDefaultTimeoutProxy_AutoRestart_StartError(t *testing.T) {
 	defer ctrl.Finish()
 
 	mockCommandPort := mocks.NewMockCommandPort(ctrl)
-	
+
 	// Initial start
 	mockCommandPort.EXPECT().Start().Return(nil)
-	
+
 	// Mock expectations for restart sequence with start error
 	mockCommandPort.EXPECT().Stop().Return(nil)
 	mockCommandPort.EXPECT().Start().Return(fmt.Errorf("start failed"))
-	
+
 	// Mock expectation for proxy.Close() at the end
 	mockCommandPort.EXPECT().Stop().Return(nil)
 
@@ -1175,7 +1184,7 @@ func TestDefaultTimeoutProxy_AutoRestart_StartError(t *testing.T) {
 
 	// Get concrete type to access restartCommand method
 	concreteProxy := proxy.(*DefaultTimeoutProxy)
-	
+
 	// Test restartCommand method handles start error gracefully
 	concreteProxy.restartCommand()
 }
@@ -1185,12 +1194,12 @@ func TestDefaultTimeoutProxy_AutoRestartEnabled_Creation(t *testing.T) {
 	defer ctrl.Finish()
 
 	mockCommandPort := mocks.NewMockCommandPort(ctrl)
-	
+
 	// Initial start
 	mockCommandPort.EXPECT().Start().Return(nil)
 	// Mock expectation for proxy.Close() at the end
 	mockCommandPort.EXPECT().Stop().Return(nil)
-	
+
 	// Create proxy with auto-restart enabled
 	factory := &DefaultTimeoutProxyFactory{}
 	timeout := 100 * time.Millisecond
@@ -1202,7 +1211,7 @@ func TestDefaultTimeoutProxy_AutoRestartEnabled_Creation(t *testing.T) {
 
 	// Get concrete type to check autoRestart field
 	concreteProxy := proxy.(*DefaultTimeoutProxy)
-	
+
 	// Verify autoRestart field is set correctly
 	if !concreteProxy.autoRestart {
 		t.Errorf("Expected autoRestart to be true, got false")
@@ -1214,12 +1223,12 @@ func TestDefaultTimeoutProxy_AutoRestartDisabled_Creation(t *testing.T) {
 	defer ctrl.Finish()
 
 	mockCommandPort := mocks.NewMockCommandPort(ctrl)
-	
+
 	// Initial start
 	mockCommandPort.EXPECT().Start().Return(nil)
 	// Mock expectation for proxy.Close() at the end
 	mockCommandPort.EXPECT().Stop().Return(nil)
-	
+
 	// Create proxy with auto-restart disabled
 	factory := &DefaultTimeoutProxyFactory{}
 	timeout := 100 * time.Millisecond
@@ -1231,7 +1240,7 @@ func TestDefaultTimeoutProxy_AutoRestartDisabled_Creation(t *testing.T) {
 
 	// Get concrete type to check autoRestart field
 	concreteProxy := proxy.(*DefaultTimeoutProxy)
-	
+
 	// Verify autoRestart field is set correctly
 	if concreteProxy.autoRestart {
 		t.Errorf("Expected autoRestart to be false, got true")
@@ -1242,7 +1251,7 @@ func TestDefaultTimeoutProxy_HandleMessage_AutoRestartTimeout(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
-	// Create proper mocks for stdin/stdout  
+	// Create proper mocks for stdin/stdout
 	mockStdin := &mockWriteCloser{Buffer: &bytes.Buffer{}}
 	mockStdout := &mockReadCloser{strings.NewReader("")}
 
@@ -1250,17 +1259,14 @@ func TestDefaultTimeoutProxy_HandleMessage_AutoRestartTimeout(t *testing.T) {
 
 	// Initial start
 	mockCommandPort.EXPECT().Start().Return(nil)
-	
+
 	// Expectations for HandleMessage IO operations (tools/call will timeout)
 	mockCommandPort.EXPECT().GetStdin().Return(mockStdin).AnyTimes()
 	mockCommandPort.EXPECT().GetStdout().Return(mockStdout).AnyTimes()
-	
-	// Auto-restart expectations when timeout occurs
-	mockCommandPort.EXPECT().Stop().Return(nil)
-	mockCommandPort.EXPECT().Start().Return(nil)
-	
-	// Final cleanup on Close()
-	mockCommandPort.EXPECT().Stop().Return(nil)
+
+	// Auto-restart expectations when timeout occurs (async, so use AnyTimes)
+	mockCommandPort.EXPECT().Stop().Return(nil).AnyTimes()
+	mockCommandPort.EXPECT().Start().Return(nil).AnyTimes()
 
 	// Create proxy with auto-restart and very short timeout
 	factory := &DefaultTimeoutProxyFactory{}
@@ -1281,7 +1287,7 @@ func TestDefaultTimeoutProxy_HandleMessage_AutoRestartTimeout(t *testing.T) {
 		JSONRPC: "2.0",
 		ID:      "test-timeout",
 		Method:  "tools/call",
-		Params:  map[string]interface{}{"name": "test_tool"},
+		Params:  map[string]any{"name": "test_tool"},
 	}
 
 	// Handle the message - should timeout and trigger auto-restart
@@ -1293,7 +1299,7 @@ func TestDefaultTimeoutProxy_HandleMessage_AutoRestartTimeout(t *testing.T) {
 	// Restore stdout and read the captured output
 	w.Close()
 	os.Stdout = originalStdout
-	
+
 	output := make([]byte, 1024)
 	n, _ := r.Read(output)
 	response := string(output[:n])
@@ -1304,6 +1310,600 @@ func TestDefaultTimeoutProxy_HandleMessage_AutoRestartTimeout(t *testing.T) {
 	}
 }
 
+func TestDefaultTimeoutProxy_HandleMessage_TimeoutMethodWithoutID(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockStdin := &mockWriteCloser{Buffer: &bytes.Buffer{}}
+	mockStdout := &mockReadCloser{strings.NewReader("")}
+	mockCommandPort := mocks.NewMockCommandPort(ctrl)
+
+	// Mock expectations for proxy creation
+	mockCommandPort.EXPECT().Start().Return(nil)
+	mockCommandPort.EXPECT().GetStdout().Return(mockStdout).AnyTimes()
+	mockCommandPort.EXPECT().GetStdin().Return(mockStdin)
+	mockCommandPort.EXPECT().Stop().Return(nil) // For Close()
+
+	factory := &DefaultTimeoutProxyFactory{}
+	proxy, err := factory.NewTimeoutProxy(time.Second, false, mockCommandPort)
+	if err != nil {
+		t.Fatalf("Failed to create proxy: %v", err)
+	}
+	defer proxy.Close()
+
+	// Test timeout method without ID (should forward directly)
+	msg := jsonrpcentities.JSONRPCMessage{
+		JSONRPC: "2.0",
+		Method:  "tools/call", // This triggers shouldApplyTimeout = true
+		// No ID field - this should make it forward directly
+		Params: map[string]any{"name": "test_tool"},
+	}
+
+	err = proxy.HandleMessage(msg)
+	if err != nil {
+		t.Errorf("Expected no error for timeout method without ID, got: %v", err)
+	}
+}
+
+func TestDefaultTimeoutProxy_HandleMessage_NonTimeoutMethod(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockStdin := &mockWriteCloser{Buffer: &bytes.Buffer{}}
+	mockStdout := &mockReadCloser{strings.NewReader("")}
+	mockCommandPort := mocks.NewMockCommandPort(ctrl)
+
+	// Mock expectations for proxy creation
+	mockCommandPort.EXPECT().Start().Return(nil)
+	mockCommandPort.EXPECT().GetStdout().Return(mockStdout).AnyTimes()
+	mockCommandPort.EXPECT().GetStdin().Return(mockStdin)
+	mockCommandPort.EXPECT().Stop().Return(nil) // For Close()
+
+	factory := &DefaultTimeoutProxyFactory{}
+	proxy, err := factory.NewTimeoutProxy(time.Second, false, mockCommandPort)
+	if err != nil {
+		t.Fatalf("Failed to create proxy: %v", err)
+	}
+	defer proxy.Close()
+
+	// Test non-timeout method (should forward directly)
+	msg := jsonrpcentities.JSONRPCMessage{
+		JSONRPC: "2.0",
+		ID:      "test-id",
+		Method:  "ping", // This should not trigger timeout handling
+		Params:  map[string]any{"data": "test"},
+	}
+
+	err = proxy.HandleMessage(msg)
+	if err != nil {
+		t.Errorf("Expected no error for non-timeout method, got: %v", err)
+	}
+}
+
+func TestDefaultTimeoutProxy_HandleMessage_NotificationMessage(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockStdin := &mockWriteCloser{Buffer: &bytes.Buffer{}}
+	mockStdout := &mockReadCloser{strings.NewReader("")}
+	mockCommandPort := mocks.NewMockCommandPort(ctrl)
+
+	// Mock expectations for proxy creation
+	mockCommandPort.EXPECT().Start().Return(nil)
+	mockCommandPort.EXPECT().GetStdout().Return(mockStdout).AnyTimes()
+	mockCommandPort.EXPECT().GetStdin().Return(mockStdin)
+	mockCommandPort.EXPECT().Stop().Return(nil) // For Close()
+
+	factory := &DefaultTimeoutProxyFactory{}
+	proxy, err := factory.NewTimeoutProxy(time.Second, false, mockCommandPort)
+	if err != nil {
+		t.Fatalf("Failed to create proxy: %v", err)
+	}
+	defer proxy.Close()
+
+	// Test notification message (no ID, should forward directly)
+	msg := jsonrpcentities.JSONRPCMessage{
+		JSONRPC: "2.0",
+		Method:  "notifications/cancelled",
+		Params:  map[string]any{"reason": "user_cancelled"},
+	}
+
+	err = proxy.HandleMessage(msg)
+	if err != nil {
+		t.Errorf("Expected no error for notification message, got: %v", err)
+	}
+}
+
+func TestDefaultTimeoutProxy_RestartCommand_ErrorPaths(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockCommandPort := mocks.NewMockCommandPort(ctrl)
+
+	// Mock expectations for initial creation
+	mockCommandPort.EXPECT().Start().Return(nil)
+	mockStdout := &mockReadCloser{strings.NewReader("")}
+	mockCommandPort.EXPECT().GetStdout().Return(mockStdout).AnyTimes()
+
+	factory := &DefaultTimeoutProxyFactory{}
+	proxy, err := factory.NewTimeoutProxy(100*time.Millisecond, true, mockCommandPort)
+	if err != nil {
+		t.Fatalf("Failed to create proxy: %v", err)
+	}
+	defer func() {
+		mockCommandPort.EXPECT().Stop().Return(nil)
+		proxy.Close()
+	}()
+
+	concreteProxy := proxy.(*DefaultTimeoutProxy)
+
+	// Test restartCommand when Stop fails
+	mockCommandPort.EXPECT().Stop().Return(fmt.Errorf("stop failed"))
+	mockCommandPort.EXPECT().Start().Return(nil)
+
+	concreteProxy.restartCommand()
+
+	// Test restartCommand when Start fails
+	mockCommandPort.EXPECT().Stop().Return(nil)
+	mockCommandPort.EXPECT().Start().Return(fmt.Errorf("start failed"))
+
+	concreteProxy.restartCommand()
+}
+
+func TestDefaultTimeoutProxy_RestartCommand_ChannelHandling(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockCommandPort := mocks.NewMockCommandPort(ctrl)
+
+	// Mock expectations for initial creation
+	mockCommandPort.EXPECT().Start().Return(nil)
+	mockStdout := &mockReadCloser{strings.NewReader("")}
+	mockCommandPort.EXPECT().GetStdout().Return(mockStdout).AnyTimes()
+
+	factory := &DefaultTimeoutProxyFactory{}
+	proxy, err := factory.NewTimeoutProxy(100*time.Millisecond, true, mockCommandPort)
+	if err != nil {
+		t.Fatalf("Failed to create proxy: %v", err)
+	}
+	defer func() {
+		mockCommandPort.EXPECT().Stop().Return(nil)
+		proxy.Close()
+	}()
+
+	concreteProxy := proxy.(*DefaultTimeoutProxy)
+
+	// Test with nil channels (simulating tests that create proxy manually)
+	concreteProxy.stopReader = nil
+	concreteProxy.readerDone = nil
+
+	// Test restartCommand with nil channels
+	mockCommandPort.EXPECT().Stop().Return(nil)
+	mockCommandPort.EXPECT().Start().Return(nil)
+
+	concreteProxy.restartCommand()
+
+	// Verify channels were recreated
+	if concreteProxy.stopReader == nil {
+		t.Error("Expected stopReader to be recreated")
+	}
+	if concreteProxy.readerDone == nil {
+		t.Error("Expected readerDone to be recreated")
+	}
+}
+
+func TestDefaultTimeoutProxy_readTargetResponses_NilStdout(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockCommandPort := mocks.NewMockCommandPort(ctrl)
+
+	proxy := &DefaultTimeoutProxy{
+		commandPort: mockCommandPort,
+		stopReader:  make(chan struct{}),
+		readerDone:  make(chan struct{}),
+	}
+
+	// Mock GetStdout to return nil initially, then a real reader
+	mockCommandPort.EXPECT().GetStdout().Return(nil).Times(2)
+	mockStdout := &mockReadCloser{strings.NewReader("")}
+	mockCommandPort.EXPECT().GetStdout().Return(mockStdout).AnyTimes()
+
+	// Start readTargetResponses in goroutine
+	go proxy.readTargetResponses()
+
+	// Give it time to hit the nil stdout case and retry
+	time.Sleep(50 * time.Millisecond)
+
+	// Stop the reader
+	close(proxy.stopReader)
+
+	// Wait for completion
+	select {
+	case <-proxy.readerDone:
+		// Success
+	case <-time.After(1 * time.Second):
+		t.Fatal("readTargetResponses did not complete in time")
+	}
+}
+
+func TestDefaultTimeoutProxy_readTargetResponses_JSONParseError(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	// Create reader with invalid JSON
+	invalidJSON := "invalid json line\n"
+	mockStdout := &mockReadCloser{strings.NewReader(invalidJSON)}
+	mockCommandPort := mocks.NewMockCommandPort(ctrl)
+	mockCommandPort.EXPECT().GetStdout().Return(mockStdout).AnyTimes()
+
+	proxy := &DefaultTimeoutProxy{
+		commandPort: mockCommandPort,
+		stopReader:  make(chan struct{}),
+		readerDone:  make(chan struct{}),
+	}
+
+	// Start readTargetResponses in goroutine
+	go proxy.readTargetResponses()
+
+	// Give it time to process
+	time.Sleep(50 * time.Millisecond)
+
+	// Stop the reader
+	close(proxy.stopReader)
+
+	// Wait for completion
+	select {
+	case <-proxy.readerDone:
+		// Success
+	case <-time.After(1 * time.Second):
+		t.Fatal("readTargetResponses did not complete in time")
+	}
+}
+
+func TestDefaultTimeoutProxy_readTargetResponses_EmptyLines(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	// Create reader with empty lines and valid JSON
+	content := "\n\n   \n{\"jsonrpc\":\"2.0\",\"id\":\"test\",\"result\":{}}\n"
+	mockStdout := &mockReadCloser{strings.NewReader(content)}
+	mockCommandPort := mocks.NewMockCommandPort(ctrl)
+	mockCommandPort.EXPECT().GetStdout().Return(mockStdout).AnyTimes()
+
+	proxy := &DefaultTimeoutProxy{
+		commandPort:  mockCommandPort,
+		stopReader:   make(chan struct{}),
+		readerDone:   make(chan struct{}),
+		pendingCalls: make(map[any]chan jsonrpcentities.JSONRPCMessage),
+	}
+
+	// Start readTargetResponses in goroutine
+	go proxy.readTargetResponses()
+
+	// Give it time to process
+	time.Sleep(50 * time.Millisecond)
+
+	// Stop the reader
+	close(proxy.stopReader)
+
+	// Wait for completion
+	select {
+	case <-proxy.readerDone:
+		// Success
+	case <-time.After(1 * time.Second):
+		t.Fatal("readTargetResponses did not complete in time")
+	}
+}
+
+func TestDefaultTimeoutProxy_readTargetResponses_PendingCallChannelClosed(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	// Create reader with tool call response
+	responseData := "{\"jsonrpc\":\"2.0\",\"id\":\"tool-call-123\",\"result\":{\"data\":\"test\"}}\n"
+	mockStdout := &mockReadCloser{strings.NewReader(responseData)}
+	mockCommandPort := mocks.NewMockCommandPort(ctrl)
+	mockCommandPort.EXPECT().GetStdout().Return(mockStdout).AnyTimes()
+
+	// Create buffered response channel for pending tool call, then fill it to block
+	responseChan := make(chan jsonrpcentities.JSONRPCMessage, 1)
+	responseChan <- jsonrpcentities.JSONRPCMessage{} // Fill the buffer to make it block on next send
+
+	pendingCalls := make(map[any]chan jsonrpcentities.JSONRPCMessage)
+	pendingCalls["tool-call-123"] = responseChan
+
+	proxy := &DefaultTimeoutProxy{
+		commandPort:  mockCommandPort,
+		stopReader:   make(chan struct{}),
+		readerDone:   make(chan struct{}),
+		pendingCalls: pendingCalls,
+		mu:           sync.RWMutex{},
+	}
+
+	// Start readTargetResponses in goroutine
+	go proxy.readTargetResponses()
+
+	// Give it time to process and attempt to send to blocked channel
+	time.Sleep(100 * time.Millisecond)
+
+	// Stop the reader
+	close(proxy.stopReader)
+
+	// Wait for completion
+	select {
+	case <-proxy.readerDone:
+		// Success
+	case <-time.After(2 * time.Second):
+		t.Fatal("readTargetResponses did not complete in time")
+	}
+}
+
+func TestDefaultTimeoutProxy_readTargetResponses_DirectForward(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	// Create reader with notification message (no ID)
+	notificationData := "{\"jsonrpc\":\"2.0\",\"method\":\"notification\",\"params\":{}}\n"
+	mockStdout := &mockReadCloser{strings.NewReader(notificationData)}
+	mockCommandPort := mocks.NewMockCommandPort(ctrl)
+	mockCommandPort.EXPECT().GetStdout().Return(mockStdout).AnyTimes()
+
+	proxy := &DefaultTimeoutProxy{
+		commandPort:  mockCommandPort,
+		stopReader:   make(chan struct{}),
+		readerDone:   make(chan struct{}),
+		pendingCalls: make(map[any]chan jsonrpcentities.JSONRPCMessage),
+	}
+
+	// Start readTargetResponses in goroutine
+	go proxy.readTargetResponses()
+
+	// Give it time to process
+	time.Sleep(50 * time.Millisecond)
+
+	// Stop the reader
+	close(proxy.stopReader)
+
+	// Wait for completion
+	select {
+	case <-proxy.readerDone:
+		// Success
+	case <-time.After(1 * time.Second):
+		t.Fatal("readTargetResponses did not complete in time")
+	}
+}
+
+func TestDefaultTimeoutProxy_sendAutoInitializeAndWait_Success(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockCommandPort := mocks.NewMockCommandPort(ctrl)
+	mockStdin := &mockWriteCloser{&bytes.Buffer{}}
+	mockCommandPort.EXPECT().GetStdin().Return(mockStdin).AnyTimes()
+
+	// Store an initialization message
+	initMsg := jsonrpcentities.JSONRPCMessage{
+		JSONRPC: "2.0",
+		ID:      "init-123",
+		Method:  "initialize",
+		Params: map[string]any{
+			"protocolVersion": "2024-11-05",
+			"capabilities": map[string]any{
+				"tools": map[string]any{
+					"listChanged": true,
+				},
+			},
+		},
+	}
+
+	proxy := &DefaultTimeoutProxy{
+		commandPort:  mockCommandPort,
+		pendingCalls: make(map[any]chan jsonrpcentities.JSONRPCMessage),
+		mu:           sync.RWMutex{},
+		initMessage:  &initMsg,
+	}
+
+	// Create a goroutine to simulate the response
+	go func() {
+		time.Sleep(10 * time.Millisecond) // Small delay to simulate response
+
+		// Simulate successful initialization response
+		response := jsonrpcentities.JSONRPCMessage{
+			JSONRPC: "2.0",
+			ID:      "init-123",
+			Result: map[string]any{
+				"protocolVersion": "2024-11-05",
+				"capabilities":    map[string]any{},
+				"serverInfo":      map[string]any{},
+			},
+		}
+
+		proxy.mu.Lock()
+		if responseChan, exists := proxy.pendingCalls["init-123"]; exists {
+			select {
+			case responseChan <- response:
+				// Response sent successfully
+			default:
+				// Channel full or closed
+			}
+		}
+		proxy.mu.Unlock()
+	}()
+
+	// Test the sendAutoInitializeAndWait function
+	proxy.sendAutoInitializeAndWait()
+
+	// Verify the pending call was cleaned up
+	proxy.mu.RLock()
+	_, exists := proxy.pendingCalls["init-123"]
+	proxy.mu.RUnlock()
+
+	if exists {
+		t.Error("Expected pending call to be cleaned up after successful response")
+	}
+}
+
+func TestDefaultTimeoutProxy_sendAutoInitializeAndWait_NoStoredMessage(t *testing.T) {
+	proxy := &DefaultTimeoutProxy{
+		pendingCalls: make(map[any]chan jsonrpcentities.JSONRPCMessage),
+		mu:           sync.RWMutex{},
+		initMessage:  nil, // No stored message
+	}
+
+	// Should return early and not panic
+	proxy.sendAutoInitializeAndWait()
+}
+
+func TestDefaultTimeoutProxy_sendAutoInitializeAndWait_Timeout(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockCommandPort := mocks.NewMockCommandPort(ctrl)
+	mockStdin := &mockWriteCloser{&bytes.Buffer{}}
+	mockCommandPort.EXPECT().GetStdin().Return(mockStdin).AnyTimes()
+
+	// Store an initialization message
+	initMsg := jsonrpcentities.JSONRPCMessage{
+		JSONRPC: "2.0",
+		ID:      "init-timeout",
+		Method:  "initialize",
+		Params:  map[string]any{},
+	}
+
+	proxy := &DefaultTimeoutProxy{
+		commandPort:  mockCommandPort,
+		pendingCalls: make(map[any]chan jsonrpcentities.JSONRPCMessage),
+		mu:           sync.RWMutex{},
+		initMessage:  &initMsg,
+	}
+
+	// Don't simulate any response - let it timeout
+	start := time.Now()
+	proxy.sendAutoInitializeAndWait()
+	duration := time.Since(start)
+
+	// Should timeout after 5 seconds
+	if duration < 4*time.Second || duration > 6*time.Second {
+		t.Errorf("Expected timeout around 5 seconds, got %v", duration)
+	}
+
+	// Verify the pending call was cleaned up
+	proxy.mu.RLock()
+	_, exists := proxy.pendingCalls["init-timeout"]
+	proxy.mu.RUnlock()
+
+	if exists {
+		t.Error("Expected pending call to be cleaned up after timeout")
+	}
+}
+
+func TestDefaultTimeoutProxy_sendAutoInitializeAndWait_ForwardError(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	// Mock stdin that will return an error when written to
+	mockCommandPort := mocks.NewMockCommandPort(ctrl)
+	mockStdin := &errorWriteCloser{}
+	mockCommandPort.EXPECT().GetStdin().Return(mockStdin).AnyTimes()
+
+	// Store an initialization message
+	initMsg := jsonrpcentities.JSONRPCMessage{
+		JSONRPC: "2.0",
+		ID:      "init-error",
+		Method:  "initialize",
+		Params:  map[string]any{},
+	}
+
+	proxy := &DefaultTimeoutProxy{
+		commandPort:  mockCommandPort,
+		pendingCalls: make(map[any]chan jsonrpcentities.JSONRPCMessage),
+		mu:           sync.RWMutex{},
+		initMessage:  &initMsg,
+	}
+
+	// Should return quickly due to forward error
+	start := time.Now()
+	proxy.sendAutoInitializeAndWait()
+	duration := time.Since(start)
+
+	// Should return immediately (not wait 5 seconds)
+	if duration > 1*time.Second {
+		t.Errorf("Expected immediate return on forward error, got %v", duration)
+	}
+
+	// Verify the pending call was cleaned up after error
+	proxy.mu.RLock()
+	_, exists := proxy.pendingCalls["init-error"]
+	proxy.mu.RUnlock()
+
+	if exists {
+		t.Error("Expected pending call to be cleaned up after forward error")
+	}
+}
+
+func TestDefaultTimeoutProxy_sendAutoInitializeAndWait_ErrorResponse(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockCommandPort := mocks.NewMockCommandPort(ctrl)
+	mockStdin := &mockWriteCloser{&bytes.Buffer{}}
+	mockCommandPort.EXPECT().GetStdin().Return(mockStdin).AnyTimes()
+
+	// Store an initialization message
+	initMsg := jsonrpcentities.JSONRPCMessage{
+		JSONRPC: "2.0",
+		ID:      "init-error-resp",
+		Method:  "initialize",
+		Params:  map[string]any{},
+	}
+
+	proxy := &DefaultTimeoutProxy{
+		commandPort:  mockCommandPort,
+		pendingCalls: make(map[any]chan jsonrpcentities.JSONRPCMessage),
+		mu:           sync.RWMutex{},
+		initMessage:  &initMsg,
+	}
+
+	// Create a goroutine to simulate an error response
+	go func() {
+		time.Sleep(10 * time.Millisecond) // Small delay to simulate response
+
+		// Simulate error initialization response
+		response := jsonrpcentities.JSONRPCMessage{
+			JSONRPC: "2.0",
+			ID:      "init-error-resp",
+			Error: &jsonrpcentities.JSONRPCError{
+				Code:    -32602,
+				Message: "Invalid params",
+			},
+		}
+
+		proxy.mu.Lock()
+		if responseChan, exists := proxy.pendingCalls["init-error-resp"]; exists {
+			select {
+			case responseChan <- response:
+				// Response sent successfully
+			default:
+				// Channel full or closed
+			}
+		}
+		proxy.mu.Unlock()
+	}()
+
+	// Test the sendAutoInitializeAndWait function
+	proxy.sendAutoInitializeAndWait()
+
+	// Verify the pending call was cleaned up
+	proxy.mu.RLock()
+	_, exists := proxy.pendingCalls["init-error-resp"]
+	proxy.mu.RUnlock()
+
+	if exists {
+		t.Error("Expected pending call to be cleaned up after error response")
+	}
+}
+
 type mockReadCloser struct {
 	*strings.Reader
 }
@@ -1311,4 +1911,3 @@ type mockReadCloser struct {
 func (m *mockReadCloser) Close() error {
 	return nil
 }
-

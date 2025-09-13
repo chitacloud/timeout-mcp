@@ -8,16 +8,16 @@ import (
 type CommandPort interface {
 	// Start starts the command process
 	Start() error
-	
+
 	// Stop stops the command process
 	Stop() error
-	
+
 	// GetStdin returns the stdin writer for the command
 	GetStdin() io.WriteCloser
-	
-	// GetStdout returns the stdout reader for the command  
+
+	// GetStdout returns the stdout reader for the command
 	GetStdout() io.ReadCloser
-	
+
 	// IsRunning returns true if the command is currently running
 	IsRunning() bool
 }

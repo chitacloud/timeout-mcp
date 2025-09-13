@@ -19,7 +19,7 @@ func parseArgs(args []string) (timeout time.Duration, autoRestart bool, command 
 	}
 
 	argIndex := 1
-	
+
 	// Check for --auto-restart flag
 	if args[argIndex] == "--auto-restart" {
 		autoRestart = true
@@ -36,12 +36,12 @@ func parseArgs(args []string) (timeout time.Duration, autoRestart bool, command 
 		err = fmt.Errorf("invalid timeout value: %v", parseErr)
 		return
 	}
-	
+
 	if timeoutSeconds <= 0 {
 		err = fmt.Errorf("invalid timeout value: must be positive, got %d", timeoutSeconds)
 		return
 	}
-	
+
 	timeout = time.Duration(timeoutSeconds) * time.Second
 	command = args[argIndex+1]
 	targetArgs = args[argIndex+2:]

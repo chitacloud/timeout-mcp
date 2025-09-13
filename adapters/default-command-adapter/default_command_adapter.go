@@ -16,9 +16,11 @@ var (
 
 // DefaultCommandAdapter implements CommandPort using os/exec
 type DefaultCommandAdapter struct {
-	cmd    *exec.Cmd
-	stdin  io.WriteCloser
-	stdout io.ReadCloser
+	command string
+	args    []string
+	cmd     *exec.Cmd
+	stdin   io.WriteCloser
+	stdout  io.ReadCloser
 }
 
 // DefaultCommandAdapterFactory implements CommandPortFactory
@@ -29,19 +31,22 @@ func (f *DefaultCommandAdapterFactory) NewCommandPort(command string, args ...st
 	if command == "" {
 		return nil, fmt.Errorf("command cannot be empty")
 	}
-	
-	cmd := exec.Command(command, args...)
-	
+
 	return &DefaultCommandAdapter{
-		cmd: cmd,
+		command: command,
+		args:    args,
 	}, nil
 }
 
 // Start starts the command process
 func (c *DefaultCommandAdapter) Start() error {
-	if c.cmd.Process != nil {
+	// Check if command is already running
+	if c.IsRunning() {
 		return fmt.Errorf("command already started")
 	}
+
+	// Create a new Cmd instance (required for restart after Stop)
+	c.cmd = exec.Command(c.command, c.args...)
 
 	stdin, err := c.cmd.StdinPipe()
 	if err != nil {
@@ -61,24 +66,29 @@ func (c *DefaultCommandAdapter) Start() error {
 
 // Stop stops the command process
 func (c *DefaultCommandAdapter) Stop() error {
-	if c.cmd.Process == nil {
+	if c.cmd == nil || c.cmd.Process == nil {
 		return fmt.Errorf("command not started")
 	}
-	
+
 	if c.stdin != nil {
 		c.stdin.Close()
+		c.stdin = nil
 	}
 	if c.stdout != nil {
 		c.stdout.Close()
+		c.stdout = nil
 	}
-	
+
 	err := c.cmd.Process.Kill()
 	if err != nil {
 		return err
 	}
-	
+
 	// Wait for the process to finish - ignore error as process was killed
 	c.cmd.Wait()
+
+	// Clear the cmd reference to allow restart
+	c.cmd = nil
 	return nil
 }
 
@@ -97,12 +107,12 @@ func (c *DefaultCommandAdapter) IsRunning() bool {
 	if c.cmd == nil || c.cmd.Process == nil {
 		return false
 	}
-	
+
 	// If ProcessState is available and process has exited, it's not running
 	if c.cmd.ProcessState != nil && c.cmd.ProcessState.Exited() {
 		return false
 	}
-	
+
 	// Check if process is still alive by sending signal 0
 	// Signal 0 is used to check if process exists without actually sending a signal
 	err := c.cmd.Process.Signal(syscall.Signal(0))
