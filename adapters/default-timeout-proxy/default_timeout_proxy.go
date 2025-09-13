@@ -177,6 +177,10 @@ func (p *DefaultTimeoutProxy) handleTimeoutMethod(msg jsonrpcentities.JSONRPCMes
 func (p *DefaultTimeoutProxy) restartCommand() {
 	log.Printf("Auto-restarting MCP server due to timeout...")
 
+	// Lock to prevent race conditions with Close()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
 	// Stop the current reader goroutine
 	if p.stopReader != nil {
 		select {
@@ -188,22 +192,25 @@ func (p *DefaultTimeoutProxy) restartCommand() {
 
 		// Wait for reader to stop
 		if p.readerDone != nil {
+			// Release lock temporarily to avoid deadlock
+			p.mu.Unlock()
 			select {
 			case <-p.readerDone:
 			case <-time.After(500 * time.Millisecond):
 				// Timeout waiting for reader to stop
 			}
+			p.mu.Lock()
 		}
 	}
 
 	if err := p.commandPort.Stop(); err != nil {
 		log.Printf("Warning: Failed to stop command during restart: %v", err)
 	}
-	p.mu.Lock()
+	
 	for id := range p.pendingCalls {
 		delete(p.pendingCalls, id)
 	}
-	p.mu.Unlock()
+	
 	if err := p.commandPort.Start(); err != nil {
 		log.Printf("Error: Failed to restart MCP server: %v", err)
 		return
@@ -401,22 +408,27 @@ func (p *DefaultTimeoutProxy) readTargetResponses() {
 	}
 }
 
-// Close cleans up the proxy resources
+// Close stops the proxy and cleans up resources
 func (p *DefaultTimeoutProxy) Close() error {
-	// Signal the reader goroutine to stop (check if channel exists and isn't closed)
-	if p.stopReader != nil {
+	p.mu.Lock()
+	stopReader := p.stopReader
+	readerDone := p.readerDone
+	p.mu.Unlock()
+
+	// Stop the reader goroutine
+	if stopReader != nil {
 		select {
-		case <-p.stopReader:
+		case <-stopReader:
 			// Already closed
 		default:
-			close(p.stopReader)
+			close(stopReader)
 		}
 	}
 
 	// Wait for the reader to finish (with timeout to avoid hanging)
-	if p.readerDone != nil {
+	if readerDone != nil {
 		select {
-		case <-p.readerDone:
+		case <-readerDone:
 			// Reader finished cleanly
 		case <-time.After(1 * time.Second):
 			// Timeout waiting for reader, continue with cleanup
