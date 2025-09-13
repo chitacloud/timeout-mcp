@@ -3,16 +3,16 @@ package defaulttimeoutproxy
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
 	"strings"
 	"testing"
 	"time"
 
-	"go.uber.org/mock/gomock"
-
-	jsonrpcentities "github.com/chitacloud/timeout-mcp/ports/jsonrpc/entities"
 	"github.com/chitacloud/timeout-mcp/mocks"
+	"github.com/chitacloud/timeout-mcp/ports/jsonrpc/entities"
+	"go.uber.org/mock/gomock"
 )
 
 func TestDefaultTimeoutProxyFactory_NewTimeoutProxy_Success(t *testing.T) {
@@ -25,7 +25,7 @@ func TestDefaultTimeoutProxyFactory_NewTimeoutProxy_Success(t *testing.T) {
 	factory := &DefaultTimeoutProxyFactory{}
 	timeout := 5 * time.Second
 
-	proxy, err := factory.NewTimeoutProxy(timeout, mockCommandPort)
+	proxy, err := factory.NewTimeoutProxy(timeout, false, mockCommandPort)
 	if err != nil {
 		t.Fatalf("Expected no error, got: %v", err)
 	}
@@ -49,7 +49,7 @@ func TestDefaultTimeoutProxyFactory_NewTimeoutProxy_StartError(t *testing.T) {
 	factory := &DefaultTimeoutProxyFactory{}
 	timeout := 5 * time.Second
 
-	proxy, err := factory.NewTimeoutProxy(timeout, mockCommandPort)
+	proxy, err := factory.NewTimeoutProxy(timeout, false, mockCommandPort)
 	if err == nil {
 		t.Fatal("Expected error when Start() fails")
 	}
@@ -1070,6 +1070,238 @@ func (e *errorWriteCloser) Write(p []byte) (n int, err error) {
 
 func (e *errorWriteCloser) Close() error {
 	return nil
+}
+
+func TestDefaultTimeoutProxy_AutoRestart_Success(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockCommandPort := mocks.NewMockCommandPort(ctrl)
+	
+	// Initial start
+	mockCommandPort.EXPECT().Start().Return(nil)
+	
+	// Mock expectations for restart sequence
+	mockCommandPort.EXPECT().Stop().Return(nil)
+	mockCommandPort.EXPECT().Start().Return(nil)
+	
+	// Mock expectation for proxy.Close() at the end
+	mockCommandPort.EXPECT().Stop().Return(nil)
+
+	// Create proxy with auto-restart enabled
+	factory := &DefaultTimeoutProxyFactory{}
+	timeout := 100 * time.Millisecond
+	proxy, err := factory.NewTimeoutProxy(timeout, true, mockCommandPort)
+	if err != nil {
+		t.Fatalf("Expected no error, got: %v", err)
+	}
+	defer proxy.Close()
+
+	// Get concrete type to access restartCommand method
+	concreteProxy := proxy.(*DefaultTimeoutProxy)
+	
+	// Add a pending call to test cleanup during restart
+	concreteProxy.mu.Lock()
+	concreteProxy.pendingCalls[1] = make(chan jsonrpcentities.JSONRPCMessage, 1)
+	concreteProxy.mu.Unlock()
+
+	// Test restartCommand method directly
+	concreteProxy.restartCommand()
+
+	// Verify pending calls were cleared
+	concreteProxy.mu.RLock()
+	if len(concreteProxy.pendingCalls) != 0 {
+		t.Errorf("Expected pending calls to be cleared, got %d", len(concreteProxy.pendingCalls))
+	}
+	concreteProxy.mu.RUnlock()
+}
+
+func TestDefaultTimeoutProxy_AutoRestart_StopError(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockCommandPort := mocks.NewMockCommandPort(ctrl)
+	
+	// Initial start
+	mockCommandPort.EXPECT().Start().Return(nil)
+	
+	// Mock expectations for restart sequence with stop error
+	mockCommandPort.EXPECT().Stop().Return(fmt.Errorf("stop failed"))
+	mockCommandPort.EXPECT().Start().Return(nil)
+	
+	// Mock expectation for proxy.Close() at the end
+	mockCommandPort.EXPECT().Stop().Return(nil)
+
+	// Create proxy with auto-restart enabled
+	factory := &DefaultTimeoutProxyFactory{}
+	timeout := 100 * time.Millisecond
+	proxy, err := factory.NewTimeoutProxy(timeout, true, mockCommandPort)
+	if err != nil {
+		t.Fatalf("Expected no error, got: %v", err)
+	}
+	defer proxy.Close()
+
+	// Get concrete type to access restartCommand method
+	concreteProxy := proxy.(*DefaultTimeoutProxy)
+	
+	// Test restartCommand method handles stop error gracefully
+	concreteProxy.restartCommand()
+}
+
+func TestDefaultTimeoutProxy_AutoRestart_StartError(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockCommandPort := mocks.NewMockCommandPort(ctrl)
+	
+	// Initial start
+	mockCommandPort.EXPECT().Start().Return(nil)
+	
+	// Mock expectations for restart sequence with start error
+	mockCommandPort.EXPECT().Stop().Return(nil)
+	mockCommandPort.EXPECT().Start().Return(fmt.Errorf("start failed"))
+	
+	// Mock expectation for proxy.Close() at the end
+	mockCommandPort.EXPECT().Stop().Return(nil)
+
+	// Create proxy with auto-restart enabled
+	factory := &DefaultTimeoutProxyFactory{}
+	timeout := 100 * time.Millisecond
+	proxy, err := factory.NewTimeoutProxy(timeout, true, mockCommandPort)
+	if err != nil {
+		t.Fatalf("Expected no error, got: %v", err)
+	}
+	defer proxy.Close()
+
+	// Get concrete type to access restartCommand method
+	concreteProxy := proxy.(*DefaultTimeoutProxy)
+	
+	// Test restartCommand method handles start error gracefully
+	concreteProxy.restartCommand()
+}
+
+func TestDefaultTimeoutProxy_AutoRestartEnabled_Creation(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockCommandPort := mocks.NewMockCommandPort(ctrl)
+	
+	// Initial start
+	mockCommandPort.EXPECT().Start().Return(nil)
+	// Mock expectation for proxy.Close() at the end
+	mockCommandPort.EXPECT().Stop().Return(nil)
+	
+	// Create proxy with auto-restart enabled
+	factory := &DefaultTimeoutProxyFactory{}
+	timeout := 100 * time.Millisecond
+	proxy, err := factory.NewTimeoutProxy(timeout, true, mockCommandPort)
+	if err != nil {
+		t.Fatalf("Expected no error, got: %v", err)
+	}
+	defer proxy.Close()
+
+	// Get concrete type to check autoRestart field
+	concreteProxy := proxy.(*DefaultTimeoutProxy)
+	
+	// Verify autoRestart field is set correctly
+	if !concreteProxy.autoRestart {
+		t.Errorf("Expected autoRestart to be true, got false")
+	}
+}
+
+func TestDefaultTimeoutProxy_AutoRestartDisabled_Creation(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	mockCommandPort := mocks.NewMockCommandPort(ctrl)
+	
+	// Initial start
+	mockCommandPort.EXPECT().Start().Return(nil)
+	// Mock expectation for proxy.Close() at the end
+	mockCommandPort.EXPECT().Stop().Return(nil)
+	
+	// Create proxy with auto-restart disabled
+	factory := &DefaultTimeoutProxyFactory{}
+	timeout := 100 * time.Millisecond
+	proxy, err := factory.NewTimeoutProxy(timeout, false, mockCommandPort)
+	if err != nil {
+		t.Fatalf("Expected no error, got: %v", err)
+	}
+	defer proxy.Close()
+
+	// Get concrete type to check autoRestart field
+	concreteProxy := proxy.(*DefaultTimeoutProxy)
+	
+	// Verify autoRestart field is set correctly
+	if concreteProxy.autoRestart {
+		t.Errorf("Expected autoRestart to be false, got true")
+	}
+}
+
+func TestDefaultTimeoutProxy_HandleMessage_AutoRestartTimeout(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	// Create proper mocks for stdin/stdout  
+	mockStdin := &mockWriteCloser{Buffer: &bytes.Buffer{}}
+	mockStdout := &mockReadCloser{strings.NewReader("")}
+
+	mockCommandPort := mocks.NewMockCommandPort(ctrl)
+
+	// Initial start
+	mockCommandPort.EXPECT().Start().Return(nil)
+	
+	// Expectations for HandleMessage IO operations (tools/call will timeout)
+	mockCommandPort.EXPECT().GetStdin().Return(mockStdin).AnyTimes()
+	mockCommandPort.EXPECT().GetStdout().Return(mockStdout).AnyTimes()
+	
+	// Auto-restart expectations when timeout occurs
+	mockCommandPort.EXPECT().Stop().Return(nil)
+	mockCommandPort.EXPECT().Start().Return(nil)
+	
+	// Final cleanup on Close()
+	mockCommandPort.EXPECT().Stop().Return(nil)
+
+	// Create proxy with auto-restart and very short timeout
+	factory := &DefaultTimeoutProxyFactory{}
+	timeout := 10 * time.Millisecond // Very short timeout to ensure it triggers
+	proxy, err := factory.NewTimeoutProxy(timeout, true, mockCommandPort)
+	if err != nil {
+		t.Fatalf("Expected no error, got: %v", err)
+	}
+	defer proxy.Close()
+
+	// Capture stdout to verify the error message contains restart notice
+	originalStdout := os.Stdout
+	r, w, _ := os.Pipe()
+	os.Stdout = w
+
+	// Create a tools/call message that will timeout
+	toolsCall := jsonrpcentities.JSONRPCMessage{
+		JSONRPC: "2.0",
+		ID:      "test-timeout",
+		Method:  "tools/call",
+		Params:  map[string]interface{}{"name": "test_tool"},
+	}
+
+	// Handle the message - should timeout and trigger auto-restart
+	err = proxy.HandleMessage(toolsCall)
+	if err != nil {
+		t.Errorf("Expected no error from HandleMessage, got: %v", err)
+	}
+
+	// Restore stdout and read the captured output
+	w.Close()
+	os.Stdout = originalStdout
+	
+	output := make([]byte, 1024)
+	n, _ := r.Read(output)
+	response := string(output[:n])
+
+	// Verify the response contains the auto-restart message
+	if !strings.Contains(response, "restarting now") {
+		t.Errorf("Expected response to contain 'restarting now', got: %s", response)
+	}
 }
 
 type mockReadCloser struct {

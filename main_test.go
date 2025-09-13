@@ -137,7 +137,7 @@ func TestTimeoutProxy_Creation(t *testing.T) {
 	}
 	
 	factory := &defaulttimeoutproxy.DefaultTimeoutProxyFactory{}
-	proxy, err := factory.NewTimeoutProxy(5*time.Second, commandPort)
+	proxy, err := factory.NewTimeoutProxy(5*time.Second, false, commandPort)
 	if err != nil {
 		t.Fatalf("Failed to create proxy: %v", err)
 	}
@@ -217,7 +217,7 @@ func TestTimeoutProxy_ActualTimeout(t *testing.T) {
 	}
 	
 	factory := &defaulttimeoutproxy.DefaultTimeoutProxyFactory{}
-	proxy, err := factory.NewTimeoutProxy(500*time.Millisecond, commandPort)
+	proxy, err := factory.NewTimeoutProxy(500*time.Millisecond, false, commandPort)
 	if err != nil {
 		t.Fatalf("Failed to create proxy: %v", err)
 	}
@@ -297,7 +297,7 @@ func TestTimeoutProxy_ForwardNonToolCalls(t *testing.T) {
 	}
 	
 	factory := &defaulttimeoutproxy.DefaultTimeoutProxyFactory{}
-	proxy, err := factory.NewTimeoutProxy(1*time.Second, commandPort)
+	proxy, err := factory.NewTimeoutProxy(1*time.Second, false, commandPort)
 	if err != nil {
 		t.Fatalf("Failed to create proxy: %v", err)
 	}
@@ -397,7 +397,7 @@ func TestTimeoutProxy_BasicForwarding(t *testing.T) {
 	}
 	
 	factory := &defaulttimeoutproxy.DefaultTimeoutProxyFactory{}
-	proxy, err := factory.NewTimeoutProxy(1*time.Second, commandPort)
+	proxy, err := factory.NewTimeoutProxy(1*time.Second, false, commandPort)
 	if err != nil {
 		t.Fatalf("Failed to create proxy: %v", err)
 	}
@@ -425,13 +425,17 @@ func TestTimeoutProxy_ResponseChannel(t *testing.T) {
 func TestParseArgs_Success(t *testing.T) {
 	args := []string{"program", "30", "echo", "hello", "world"}
 	
-	timeout, command, targetArgs, err := parseArgs(args)
+	timeout, autoRestart, command, targetArgs, err := parseArgs(args)
 	if err != nil {
 		t.Errorf("Expected no error, got: %v", err)
 	}
 	
 	if timeout != 30*time.Second {
 		t.Errorf("Expected timeout 30s, got %v", timeout)
+	}
+	
+	if autoRestart != false {
+		t.Errorf("Expected autoRestart false, got %v", autoRestart)
 	}
 	
 	if command != "echo" {
@@ -452,13 +456,17 @@ func TestParseArgs_Success(t *testing.T) {
 func TestParseArgs_NoTargetArgs(t *testing.T) {
 	args := []string{"program", "15", "ls"}
 	
-	timeout, command, targetArgs, err := parseArgs(args)
+	timeout, autoRestart, command, targetArgs, err := parseArgs(args)
 	if err != nil {
 		t.Errorf("Expected no error, got: %v", err)
 	}
 	
 	if timeout != 15*time.Second {
 		t.Errorf("Expected timeout 15s, got %v", timeout)
+	}
+	
+	if autoRestart != false {
+		t.Errorf("Expected autoRestart false, got %v", autoRestart)
 	}
 	
 	if command != "ls" {
@@ -482,7 +490,7 @@ func TestParseArgs_InsufficientArgs(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, _, _, err := parseArgs(tt.args)
+			_, _, _, _, err := parseArgs(tt.args)
 			if err == nil {
 				t.Error("Expected error for insufficient arguments")
 			}
@@ -509,7 +517,7 @@ func TestParseArgs_InvalidTimeout(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			args := []string{"program", tt.timeout, "echo", "hello"}
 			
-			_, _, _, err := parseArgs(args)
+			_, _, _, _, err := parseArgs(args)
 			if err == nil {
 				t.Error("Expected error for invalid timeout")
 			}
@@ -526,7 +534,7 @@ func TestRunProxy_InvalidCommand(t *testing.T) {
 	command := "non_existent_command_12345"
 	targetArgs := []string{}
 
-	err := runProxy(timeout, command, targetArgs)
+	err := runProxy(timeout, false, command, targetArgs)
 	if err == nil {
 		t.Error("Expected error for invalid command")
 	}
@@ -542,7 +550,7 @@ func TestRunProxy_ProxyRunError(t *testing.T) {
 	command := "false" // Command that always exits with code 1
 	targetArgs := []string{}
 
-	err := runProxy(timeout, command, targetArgs)
+	err := runProxy(timeout, false, command, targetArgs)
 	// This should complete without error since the proxy handles subprocess termination gracefully
 	if err != nil {
 		t.Errorf("Expected no error from runProxy with 'false' command, got: %v", err)
@@ -557,7 +565,7 @@ func TestRunProxy_SuccessWithEcho(t *testing.T) {
 
 	// This should complete successfully, though it won't produce meaningful output
 	// since we're not providing any stdin input
-	err := runProxy(timeout, command, targetArgs)
+	err := runProxy(timeout, false, command, targetArgs)
 	if err != nil {
 		t.Errorf("Expected no error from runProxy with echo, got: %v", err)
 	}

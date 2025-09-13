@@ -64,8 +64,9 @@ done`
 	}
 
 	// Create timeout proxy with 2 second timeout
+	timeout := 2 * time.Second
 	factory := &defaulttimeoutproxy.DefaultTimeoutProxyFactory{}
-	proxy, err := factory.NewTimeoutProxy(2*time.Second, commandPort)
+	proxy, err := factory.NewTimeoutProxy(timeout, false, commandPort)
 	if err != nil {
 		t.Fatalf("Failed to create proxy: %v", err)
 	}
@@ -156,7 +157,7 @@ done`
 	}
 
 	factory := &defaulttimeoutproxy.DefaultTimeoutProxyFactory{}
-	proxy, err := factory.NewTimeoutProxy(1*time.Second, commandPort)
+	proxy, err := factory.NewTimeoutProxy(1*time.Second, false, commandPort)
 	if err != nil {
 		t.Fatalf("Failed to create proxy: %v", err)
 	}
@@ -193,7 +194,7 @@ func TestTimeoutProxy_IntegrationWithEcho(t *testing.T) {
 	}
 
 	factory := &defaulttimeoutproxy.DefaultTimeoutProxyFactory{}
-	proxy, err := factory.NewTimeoutProxy(5*time.Second, commandPort)
+	proxy, err := factory.NewTimeoutProxy(5*time.Second, false, commandPort)
 	if err != nil {
 		t.Fatalf("Failed to create proxy: %v", err)
 	}

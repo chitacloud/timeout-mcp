@@ -80,12 +80,13 @@ go install github.com/chitacloud/timeout-mcp@v0.0.0-rc01
 ### Basic Usage
 
 ```bash
-timeout-mcp 30 uvx my-mcp-server --arg1 value1
+timeout-mcp [--auto-restart] <duration> <command> [args...]
 ```
 
 ### Arguments
 
 - `<duration>`: Timeout duration in seconds for critical MCP methods (`tools/call`, `initialize`, `tools/list`) (default: 30)
+- `--auto-restart`: (Optional) Automatically restart the MCP server when a timeout occurs
 
 ### Examples
 
@@ -102,6 +103,16 @@ timeout-mcp 60 node filesystem-mcp-server.js --root /safe/directory
 #### Short Timeout for Testing
 ```bash
 timeout-mcp 5 python slow-mcp-server.py
+```
+
+#### Auto-Restart on Timeout
+```bash
+timeout-mcp --auto-restart 30 python unreliable-mcp-server.py
+```
+
+#### Auto-Restart with Custom Timeout
+```bash
+timeout-mcp --auto-restart 45 uvx weather-mcp --api-key YOUR_KEY
 ```
 
 ## JSON-RPC Behavior
@@ -147,6 +158,38 @@ The following methods have timeout applied:
 // Resources - forwarded immediately
 {"jsonrpc": "2.0", "id": 3, "method": "resources/list"}
 ```
+
+## Auto-Restart Feature
+
+When the `--auto-restart` flag is enabled, the wrapper automatically restarts the underlying MCP server subprocess whenever a timeout occurs on critical methods (`tools/call`, `initialize`, `tools/list`).
+
+### Behavior
+
+- **Timeout Detection**: When a timeout occurs on a critical method
+- **Error Response**: Returns a JSON-RPC error with the suffix `(restarting now...)`
+- **Background Restart**: Asynchronously stops and restarts the MCP server subprocess
+- **State Cleanup**: Clears any pending calls to avoid stale state
+- **Logging**: Emits restart logs for visibility
+
+### Example Error Response with Auto-Restart
+
+```json
+// Timeout Response with auto-restart enabled
+{"jsonrpc": "2.0", "id": 1, "error": {"code": -32603, "message": "Method 'tools/call' timed out after 30s (restarting now...)"}}
+```
+
+### Use Cases
+
+- **Unreliable MCP Servers**: Automatically recover from hanging or crashed servers
+- **Development**: Quickly recover from server bugs during testing
+- **Production Resilience**: Maintain service availability despite intermittent server issues
+
+### Important Notes
+
+- Auto-restart only triggers on timeout, not on other errors
+- The restart process runs in the background to avoid blocking the proxy
+- Pending calls are cleared during restart to prevent inconsistent state
+- Restart failures are logged but don't crash the wrapper
 
 ## Development
 

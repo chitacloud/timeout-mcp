@@ -20,9 +20,10 @@ var (
 	_ timeoutport.TimeoutProxy = (*DefaultTimeoutProxy)(nil)
 )
 
-// DefaultTimeoutProxy implements the TimeoutProxy interface using CommandPort
+// DefaultTimeoutProxy implements TimeoutProxy interface
 type DefaultTimeoutProxy struct {
 	timeout      time.Duration
+	autoRestart  bool
 	commandPort  commandport.CommandPort
 	pendingCalls map[interface{}]chan jsonrpcentities.JSONRPCMessage
 	mu           sync.RWMutex
@@ -32,7 +33,7 @@ type DefaultTimeoutProxy struct {
 type DefaultTimeoutProxyFactory struct{}
 
 // NewTimeoutProxy creates a new DefaultTimeoutProxy instance
-func (f *DefaultTimeoutProxyFactory) NewTimeoutProxy(timeout time.Duration, commandPort commandport.CommandPort) (timeoutport.TimeoutProxy, error) {
+func (f *DefaultTimeoutProxyFactory) NewTimeoutProxy(timeout time.Duration, autoRestart bool, commandPort commandport.CommandPort) (timeoutport.TimeoutProxy, error) {
 	// Start the command
 	if err := commandPort.Start(); err != nil {
 		return nil, fmt.Errorf("failed to start command: %w", err)
@@ -40,6 +41,7 @@ func (f *DefaultTimeoutProxyFactory) NewTimeoutProxy(timeout time.Duration, comm
 
 	return &DefaultTimeoutProxy{
 		timeout:      timeout,
+		autoRestart:  autoRestart,
 		commandPort:  commandPort,
 		pendingCalls: make(map[interface{}]chan jsonrpcentities.JSONRPCMessage),
 	}, nil
@@ -135,16 +137,50 @@ func (p *DefaultTimeoutProxy) handleTimeoutMethod(msg jsonrpcentities.JSONRPCMes
 		p.mu.Unlock()
 
 		// Send timeout error response
+		var errorMessage string
+		if p.autoRestart {
+			errorMessage = fmt.Sprintf("Method '%s' timed out after %s (restarting now...)", msg.Method, p.timeout.String())
+			// Trigger restart in background
+			go p.restartCommand()
+		} else {
+			errorMessage = fmt.Sprintf("Method '%s' timed out after %s", msg.Method, p.timeout.String())
+		}
+		
 		errorResponse := jsonrpcentities.JSONRPCMessage{
 			JSONRPC: "2.0",
 			ID:      msg.ID,
 			Error: &jsonrpcentities.JSONRPCError{
 				Code:    -32603, // Internal error code
-				Message: fmt.Sprintf("Method '%s' timed out after %s", msg.Method, p.timeout.String()),
+				Message: errorMessage,
 			},
 		}
 		return p.sendToClient(errorResponse)
 	}
+}
+
+// restartCommand restarts the underlying MCP server process
+func (p *DefaultTimeoutProxy) restartCommand() {
+	log.Printf("Auto-restarting MCP server due to timeout...")
+	
+	// Stop the current command
+	if err := p.commandPort.Stop(); err != nil {
+		log.Printf("Warning: Failed to stop command during restart: %v", err)
+	}
+	
+	// Clear all pending calls since they're invalid after restart
+	p.mu.Lock()
+	for id := range p.pendingCalls {
+		delete(p.pendingCalls, id)
+	}
+	p.mu.Unlock()
+	
+	// Start the command again
+	if err := p.commandPort.Start(); err != nil {
+		log.Printf("Error: Failed to restart MCP server: %v", err)
+		return
+	}
+	
+	log.Printf("MCP server restarted successfully")
 }
 
 // forwardMessage sends a message to the target MCP server

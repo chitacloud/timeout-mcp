@@ -25,5 +25,5 @@ type TimeoutProxy interface {
 // TimeoutProxyFactory creates instances of TimeoutProxy
 type TimeoutProxyFactory interface {
 	// NewTimeoutProxy creates a new timeout proxy instance with a command port
-	NewTimeoutProxy(timeout time.Duration, commandPort commandport.CommandPort) (TimeoutProxy, error)
+	NewTimeoutProxy(timeout time.Duration, autoRestart bool, commandPort commandport.CommandPort) (TimeoutProxy, error)
 }
