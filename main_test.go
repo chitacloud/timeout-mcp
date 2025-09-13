@@ -4,12 +4,17 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
 	"reflect"
 	"strings"
 	"testing"
 	"time"
+
+	"go.uber.org/mock/gomock"
+
+	"github.com/chitacloud/timeout-mcp/mocks"
 
 	defaultcommandadapter "github.com/chitacloud/timeout-mcp/adapters/default-command-adapter"
 	defaulttimeoutproxy "github.com/chitacloud/timeout-mcp/adapters/default-timeout-proxy"
@@ -703,7 +708,7 @@ func TestRunProxy_ZeroTimeout(t *testing.T) {
 func TestRunProxy_NegativeTimeout(t *testing.T) {
 	// Test with negative timeout - validation should happen in parseArgs
 	err := runProxy(-5*time.Second, false, "echo", []string{"test"})
-	// If proxy allows negative timeout, that's fine - the validation happens in parseArgs  
+	// If proxy allows negative timeout, that's fine - the validation happens in parseArgs
 	if err != nil && !strings.Contains(err.Error(), "failed to create proxy:") {
 		t.Errorf("runProxy() unexpected error type: %v", err)
 	}
@@ -792,7 +797,144 @@ func TestMainUsageMessage(t *testing.T) {
 	}
 }
 
-// Edge case tests for better coverage
+// Test runProxy error paths using proper mocks to improve coverage
+func TestRunProxyWithFactories_MockedProxyRunError(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	// Create mock command port and factory
+	mockCommandPort := mocks.NewMockCommandPort(ctrl)
+	mockCommandFactory := mocks.NewMockCommandPortFactory(ctrl)
+
+	// Create mock timeout proxy and factory
+	mockTimeoutProxy := mocks.NewMockTimeoutProxy(ctrl)
+	mockProxyFactory := mocks.NewMockTimeoutProxyFactory(ctrl)
+
+	timeout := 5 * time.Second
+	command := "test-command"
+	targetArgs := []string{"arg1", "arg2"}
+
+	// Set up expectations
+	mockCommandFactory.EXPECT().
+		NewCommandPort(command, "arg1", "arg2").
+		Return(mockCommandPort, nil)
+
+	mockProxyFactory.EXPECT().
+		NewTimeoutProxy(timeout, false, mockCommandPort).
+		Return(mockTimeoutProxy, nil)
+
+	mockTimeoutProxy.EXPECT().Close()
+	mockTimeoutProxy.EXPECT().Run().Return(fmt.Errorf("proxy run failed"))
+
+	// Test the function
+	err := runProxyWithFactories(timeout, false, command, targetArgs, mockCommandFactory, mockProxyFactory)
+
+	if err == nil {
+		t.Error("Expected error when proxy.Run() fails")
+	}
+
+	if !strings.Contains(err.Error(), "proxy error:") {
+		t.Errorf("Expected 'proxy error:' prefix, got: %v", err)
+	}
+}
+
+func TestRunProxyWithFactories_CommandPortCreationError(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	// Create mock factories
+	mockCommandFactory := mocks.NewMockCommandPortFactory(ctrl)
+	mockProxyFactory := mocks.NewMockTimeoutProxyFactory(ctrl)
+
+	timeout := 5 * time.Second
+	command := "test-command"
+	targetArgs := []string{"arg1"}
+
+	// Set up expectation for command port creation failure
+	mockCommandFactory.EXPECT().
+		NewCommandPort(command, "arg1").
+		Return(nil, fmt.Errorf("command not found"))
+
+	// Test the function
+	err := runProxyWithFactories(timeout, false, command, targetArgs, mockCommandFactory, mockProxyFactory)
+
+	if err == nil {
+		t.Error("Expected error when command port creation fails")
+	}
+
+	if !strings.Contains(err.Error(), "failed to create command port:") {
+		t.Errorf("Expected 'failed to create command port:' prefix, got: %v", err)
+	}
+}
+
+func TestRunProxyWithFactories_ProxyCreationError(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	// Create mocks
+	mockCommandPort := mocks.NewMockCommandPort(ctrl)
+	mockCommandFactory := mocks.NewMockCommandPortFactory(ctrl)
+	mockProxyFactory := mocks.NewMockTimeoutProxyFactory(ctrl)
+
+	timeout := 5 * time.Second
+	command := "test-command"
+	targetArgs := []string{}
+
+	// Set up expectations
+	mockCommandFactory.EXPECT().
+		NewCommandPort(command).
+		Return(mockCommandPort, nil)
+
+	mockProxyFactory.EXPECT().
+		NewTimeoutProxy(timeout, true, mockCommandPort).
+		Return(nil, fmt.Errorf("proxy creation failed"))
+
+	// Test the function
+	err := runProxyWithFactories(timeout, true, command, targetArgs, mockCommandFactory, mockProxyFactory)
+
+	if err == nil {
+		t.Error("Expected error when proxy creation fails")
+	}
+
+	if !strings.Contains(err.Error(), "failed to create proxy:") {
+		t.Errorf("Expected 'failed to create proxy:' prefix, got: %v", err)
+	}
+}
+
+func TestRunProxyWithFactories_Success(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	// Create mocks
+	mockCommandPort := mocks.NewMockCommandPort(ctrl)
+	mockCommandFactory := mocks.NewMockCommandPortFactory(ctrl)
+	mockTimeoutProxy := mocks.NewMockTimeoutProxy(ctrl)
+	mockProxyFactory := mocks.NewMockTimeoutProxyFactory(ctrl)
+
+	timeout := 5 * time.Second
+	command := "test-command"
+	targetArgs := []string{"arg1", "arg2"}
+
+	// Set up expectations
+	mockCommandFactory.EXPECT().
+		NewCommandPort(command, "arg1", "arg2").
+		Return(mockCommandPort, nil)
+
+	mockProxyFactory.EXPECT().
+		NewTimeoutProxy(timeout, false, mockCommandPort).
+		Return(mockTimeoutProxy, nil)
+
+	mockTimeoutProxy.EXPECT().Close()
+	mockTimeoutProxy.EXPECT().Run().Return(nil)
+
+	// Test the function
+	err := runProxyWithFactories(timeout, false, command, targetArgs, mockCommandFactory, mockProxyFactory)
+
+	if err != nil {
+		t.Errorf("Expected no error on success, got: %v", err)
+	}
+}
+
 func TestParseArgs_EdgeCases(t *testing.T) {
 	tests := []struct {
 		name        string

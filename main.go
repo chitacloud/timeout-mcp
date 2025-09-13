@@ -9,6 +9,8 @@ import (
 
 	defaultcommandadapter "github.com/chitacloud/timeout-mcp/adapters/default-command-adapter"
 	defaulttimeoutproxy "github.com/chitacloud/timeout-mcp/adapters/default-timeout-proxy"
+	commandport "github.com/chitacloud/timeout-mcp/ports/command-port"
+	timeoutport "github.com/chitacloud/timeout-mcp/ports/timeout-port"
 )
 
 // parseArgs validates and parses command line arguments
@@ -50,16 +52,22 @@ func parseArgs(args []string) (timeout time.Duration, autoRestart bool, command 
 
 // runProxy creates and runs the timeout proxy with the given parameters
 func runProxy(timeout time.Duration, autoRestart bool, command string, targetArgs []string) error {
+	return runProxyWithFactories(timeout, autoRestart, command, targetArgs,
+		&defaultcommandadapter.DefaultCommandAdapterFactory{},
+		&defaulttimeoutproxy.DefaultTimeoutProxyFactory{})
+}
+
+// runProxyWithFactories allows injection of factory dependencies for testing
+func runProxyWithFactories(timeout time.Duration, autoRestart bool, command string, targetArgs []string,
+	commandFactory commandport.CommandPortFactory, proxyFactory timeoutport.TimeoutProxyFactory) error {
 	// Create command port
-	commandFactory := &defaultcommandadapter.DefaultCommandAdapterFactory{}
-	commandPort, err := commandFactory.NewCommandPort(command, targetArgs...)
+	commandPortInstance, err := commandFactory.NewCommandPort(command, targetArgs...)
 	if err != nil {
 		return fmt.Errorf("failed to create command port: %v", err)
 	}
 
-	// Create factory and proxy using the new architecture
-	factory := &defaulttimeoutproxy.DefaultTimeoutProxyFactory{}
-	proxy, err := factory.NewTimeoutProxy(timeout, autoRestart, commandPort)
+	// Create proxy using the factory
+	proxy, err := proxyFactory.NewTimeoutProxy(timeout, autoRestart, commandPortInstance)
 	if err != nil {
 		return fmt.Errorf("failed to create proxy: %v", err)
 	}
