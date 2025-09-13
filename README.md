@@ -72,7 +72,7 @@ The wrapper follows the Ports and Adapters (Hexagonal) architecture:
 ## Installation
 
 ```bash
-go install github.com/chitacloud/timeout-mcp@v0.0.0-rc01
+go install github.com/chitacloud/timeout-mcp@v0.0.0
 ```
 
 ## Usage

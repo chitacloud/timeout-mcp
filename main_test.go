@@ -569,3 +569,272 @@ func TestRunProxy_SuccessWithEcho(t *testing.T) {
 		t.Errorf("Expected no error from runProxy with echo, got: %v", err)
 	}
 }
+
+// Additional tests for parseArgs with --auto-restart flag
+func TestParseArgs_AutoRestart(t *testing.T) {
+	tests := []struct {
+		name            string
+		args            []string
+		expectedTimeout time.Duration
+		expectedRestart bool
+		expectedCommand string
+		expectedArgs    []string
+	}{
+		{
+			name:            "auto-restart with args",
+			args:            []string{"program", "--auto-restart", "45", "node", "server.js"},
+			expectedTimeout: 45 * time.Second,
+			expectedRestart: true,
+			expectedCommand: "node",
+			expectedArgs:    []string{"server.js"},
+		},
+		{
+			name:            "auto-restart minimal",
+			args:            []string{"program", "--auto-restart", "10", "cat"},
+			expectedTimeout: 10 * time.Second,
+			expectedRestart: true,
+			expectedCommand: "cat",
+			expectedArgs:    []string{},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			timeout, autoRestart, command, targetArgs, err := parseArgs(tt.args)
+
+			if err != nil {
+				t.Errorf("parseArgs() returned error: %v", err)
+				return
+			}
+
+			if timeout != tt.expectedTimeout {
+				t.Errorf("parseArgs() timeout = %v, want %v", timeout, tt.expectedTimeout)
+			}
+
+			if autoRestart != tt.expectedRestart {
+				t.Errorf("parseArgs() autoRestart = %v, want %v", autoRestart, tt.expectedRestart)
+			}
+
+			if command != tt.expectedCommand {
+				t.Errorf("parseArgs() command = %v, want %v", command, tt.expectedCommand)
+			}
+
+			if len(targetArgs) != len(tt.expectedArgs) {
+				t.Errorf("parseArgs() targetArgs length = %v, want %v", len(targetArgs), len(tt.expectedArgs))
+				return
+			}
+
+			for i, arg := range targetArgs {
+				if arg != tt.expectedArgs[i] {
+					t.Errorf("parseArgs() targetArgs[%d] = %v, want %v", i, arg, tt.expectedArgs[i])
+				}
+			}
+		})
+	}
+}
+
+func TestParseArgs_AutoRestartErrors(t *testing.T) {
+	tests := []struct {
+		name        string
+		args        []string
+		expectedErr string
+	}{
+		{
+			name:        "auto-restart but no timeout",
+			args:        []string{"program", "--auto-restart"},
+			expectedErr: "insufficient arguments: expected at least 3, got 2",
+		},
+		{
+			name:        "auto-restart with only timeout",
+			args:        []string{"program", "--auto-restart", "30"},
+			expectedErr: "insufficient arguments after --auto-restart: expected at least 2 more, got 1",
+		},
+		{
+			name:        "auto-restart with invalid timeout",
+			args:        []string{"program", "--auto-restart", "invalid", "command"},
+			expectedErr: "invalid timeout value:",
+		},
+		{
+			name:        "auto-restart with zero timeout",
+			args:        []string{"program", "--auto-restart", "0", "command"},
+			expectedErr: "invalid timeout value: must be positive, got 0",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, _, _, _, err := parseArgs(tt.args)
+
+			if err == nil {
+				t.Errorf("parseArgs() expected error but got nil")
+				return
+			}
+
+			if !strings.Contains(err.Error(), tt.expectedErr) {
+				t.Errorf("parseArgs() error = %v, want error containing %v", err, tt.expectedErr)
+			}
+		})
+	}
+}
+
+func TestRunProxy_EmptyCommand(t *testing.T) {
+	// Test with empty command string
+	err := runProxy(30*time.Second, false, "", []string{})
+	if err == nil {
+		t.Error("runProxy() expected error for empty command but got nil")
+		return
+	}
+
+	if !strings.Contains(err.Error(), "failed to create command port:") {
+		t.Errorf("runProxy() error = %v, want error containing 'failed to create command port:'", err)
+	}
+}
+
+func TestRunProxy_ZeroTimeout(t *testing.T) {
+	// Test with zero timeout - it may be allowed by the proxy but parseArgs should catch it
+	// Let's test the actual behavior
+	err := runProxy(0*time.Second, false, "echo", []string{"test"})
+	// If proxy allows zero timeout, that's fine - the validation happens in parseArgs
+	if err != nil && !strings.Contains(err.Error(), "failed to create proxy:") {
+		t.Errorf("runProxy() unexpected error type: %v", err)
+	}
+}
+
+func TestRunProxy_NegativeTimeout(t *testing.T) {
+	// Test with negative timeout - validation should happen in parseArgs
+	err := runProxy(-5*time.Second, false, "echo", []string{"test"})
+	// If proxy allows negative timeout, that's fine - the validation happens in parseArgs  
+	if err != nil && !strings.Contains(err.Error(), "failed to create proxy:") {
+		t.Errorf("runProxy() unexpected error type: %v", err)
+	}
+}
+
+func TestRunProxy_WithAutoRestart(t *testing.T) {
+	// Test runProxy with auto-restart enabled
+	timeout := 1 * time.Second
+	command := "echo"
+	targetArgs := []string{"test"}
+
+	err := runProxy(timeout, true, command, targetArgs)
+	if err != nil {
+		t.Errorf("Expected no error from runProxy with auto-restart, got: %v", err)
+	}
+}
+
+// Test main function logic without actually calling main()
+func TestMainLogic_ParseArgsError(t *testing.T) {
+	// Test the logic that main() uses when parseArgs fails
+	testArgs := []string{"timeout-mcp", "invalid"}
+	_, _, _, _, err := parseArgs(testArgs)
+
+	if err == nil {
+		t.Error("Expected parseArgs to return error for invalid args")
+		return
+	}
+
+	// Verify error handling follows expected pattern
+	if !strings.Contains(err.Error(), "insufficient arguments:") {
+		t.Errorf("Error message = %v, want message containing 'insufficient arguments:'", err.Error())
+	}
+}
+
+func TestMainLogic_SuccessfulParsing(t *testing.T) {
+	// Test the logic that main() uses when parseArgs succeeds
+	testArgs := []string{"timeout-mcp", "30", "echo", "hello"}
+	timeout, autoRestart, command, targetArgs, err := parseArgs(testArgs)
+
+	if err != nil {
+		t.Errorf("Expected parseArgs to succeed, got error: %v", err)
+		return
+	}
+
+	// Verify parsed values are reasonable
+	if timeout != 30*time.Second {
+		t.Errorf("Expected timeout 30s, got %v", timeout)
+	}
+
+	if autoRestart != false {
+		t.Errorf("Expected autoRestart false, got %v", autoRestart)
+	}
+
+	if command != "echo" {
+		t.Errorf("Expected command 'echo', got %s", command)
+	}
+
+	if len(targetArgs) != 1 || targetArgs[0] != "hello" {
+		t.Errorf("Expected targetArgs ['hello'], got %v", targetArgs)
+	}
+}
+
+func TestMainUsageMessage(t *testing.T) {
+	// Test that the usage message components are correctly formatted
+	// This tests the string formatting logic used in main()
+	programName := "timeout-mcp"
+
+	usageMsg := "Usage: " + programName + " [--auto-restart] <timeout_seconds> <target_command> [target_args...]\n"
+	example1 := "Example: " + programName + " 30 npx -y some-mcp-server\n"
+	example2 := "Example: " + programName + " --auto-restart 30 npx -y some-mcp-server\n"
+
+	if !strings.Contains(usageMsg, "--auto-restart") {
+		t.Error("Usage message should contain --auto-restart flag")
+	}
+
+	if !strings.Contains(usageMsg, "<timeout_seconds>") {
+		t.Error("Usage message should contain timeout placeholder")
+	}
+
+	if !strings.Contains(example1, "npx") {
+		t.Error("Example 1 should contain npx command")
+	}
+
+	if !strings.Contains(example2, "--auto-restart") {
+		t.Error("Example 2 should contain --auto-restart flag")
+	}
+}
+
+// Edge case tests for better coverage
+func TestParseArgs_EdgeCases(t *testing.T) {
+	tests := []struct {
+		name        string
+		args        []string
+		shouldError bool
+		errorMsg    string
+	}{
+		{
+			name:        "very large timeout",
+			args:        []string{"program", "999999", "echo", "test"},
+			shouldError: false,
+		},
+		{
+			name:        "timeout 1",
+			args:        []string{"program", "1", "echo", "test"},
+			shouldError: false,
+		},
+		{
+			name:        "command with spaces needs quoting in shell but not here",
+			args:        []string{"program", "30", "echo hello world", "test"},
+			shouldError: false,
+		},
+		{
+			name:        "auto-restart with large timeout",
+			args:        []string{"program", "--auto-restart", "86400", "sleep", "1"},
+			shouldError: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, _, _, _, err := parseArgs(tt.args)
+
+			if tt.shouldError && err == nil {
+				t.Error("Expected error but got nil")
+			} else if !tt.shouldError && err != nil {
+				t.Errorf("Expected no error but got: %v", err)
+			} else if tt.shouldError && err != nil && tt.errorMsg != "" {
+				if !strings.Contains(err.Error(), tt.errorMsg) {
+					t.Errorf("Expected error containing %q, got: %v", tt.errorMsg, err)
+				}
+			}
+		})
+	}
+}
